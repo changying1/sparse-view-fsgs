@@ -25,7 +25,6 @@ import json
 import cv2
 import math
 import torch
-import open3d as o3d
 from tqdm import tqdm
 from pathlib import Path
 from plyfile import PlyData, PlyElement
