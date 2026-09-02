@@ -1,13 +1,13 @@
 import torch
 
-midas = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid")
+midas = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid", trust_repo=True, skip_validation=True)
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 midas.to(device)
 midas.eval()
 for param in midas.parameters():
     param.requires_grad = False
 
-midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True, skip_validation=True)
 transform = midas_transforms.dpt_transform
 downsampling = 1
 
