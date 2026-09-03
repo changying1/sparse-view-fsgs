@@ -20,6 +20,12 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation, chamfer_dist
+from utils.growth_diagnostics import (
+    GrowthDiagnostics,
+    count_proximity_proposed,
+    count_split_candidates,
+    format_proximity_growth_log,
+)
 from torch.optim.lr_scheduler import MultiStepLR
 
 
@@ -401,10 +407,21 @@ class GaussianModel:
         self.confidence = torch.cat([self.confidence, torch.ones(new_opacities.shape, device="cuda")], 0)
 
 
-    def proximity(self, scene_extent, N = 3):
+    def proximity(self, scene_extent, iteration=None, N = 3):
         dist, nearest_indices = distCUDA2(self.get_xyz)
         selected_pts_mask = torch.logical_and(dist > (5. * scene_extent),
                                               torch.max(self.get_scaling, dim=1).values > (scene_extent))
+        proximity_sources = int(selected_pts_mask.sum().item())
+        proximity_proposed = count_proximity_proposed(proximity_sources, N)
+        print(
+            format_proximity_growth_log(
+                iteration=iteration,
+                num_before=self.get_xyz.shape[0],
+                proximity_sources=proximity_sources,
+                proximity_proposed=proximity_proposed,
+            ),
+            flush=True,
+        )
 
         new_indices = nearest_indices[selected_pts_mask].reshape(-1).long()
         source_xyz = self._xyz[selected_pts_mask].repeat(1, N, 1).reshape(-1, 3)
@@ -417,6 +434,7 @@ class GaussianModel:
         new_features_rest = torch.zeros_like(self._features_rest[new_indices])
         new_opacity = self._opacity[new_indices]
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        return proximity_sources, proximity_proposed
 
 
 
@@ -429,11 +447,14 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling,
                                                         dim=1).values > self.percent_dense * scene_extent)
+        split_gradient_mask = selected_pts_mask
 
         dist, _ = distCUDA2(self.get_xyz)
         selected_pts_mask2 = torch.logical_and(dist > (self.args.dist_thres * scene_extent),
                                                torch.max(self.get_scaling, dim=1).values > ( scene_extent))
+        split_sparse_mask = selected_pts_mask2
         selected_pts_mask = torch.logical_or(selected_pts_mask, selected_pts_mask2)
+        split_stats = count_split_candidates(split_gradient_mask, split_sparse_mask, selected_pts_mask)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
@@ -451,6 +472,7 @@ class GaussianModel:
         prune_filter = torch.cat(
             (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter, iter)
+        return split_stats
 
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
@@ -459,6 +481,7 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling,
                                                         dim=1).values <= self.percent_dense * scene_extent)
+        clone_candidates = int(selected_pts_mask.sum().item())
 
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -469,16 +492,25 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
                                    new_rotation)
+        return clone_candidates
 
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iter):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
+        growth_diag = GrowthDiagnostics(iteration=iter, num_before=self.get_xyz.shape[0])
 
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent, iter)
+        growth_diag.clone_candidates = self.densify_and_clone(grads, max_grad, extent)
+        growth_diag.num_after_clone = self.get_xyz.shape[0]
+        (
+            growth_diag.split_gradient_candidates,
+            growth_diag.split_sparse_candidates,
+            growth_diag.split_total_candidates,
+        ) = self.densify_and_split(grads, max_grad, extent, iter)
+        growth_diag.num_after_split = self.get_xyz.shape[0]
         if iter < 2000:
-            self.proximity(extent)
+            growth_diag.proximity_sources, growth_diag.proximity_proposed = self.proximity(extent, iteration=iter)
+        growth_diag.num_after_proximity = self.get_xyz.shape[0]
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
@@ -487,6 +519,8 @@ class GaussianModel:
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
 
         self.prune_points(prune_mask, iter)
+        growth_diag.num_after_prune = self.get_xyz.shape[0]
+        print(growth_diag.format_log())
         torch.cuda.empty_cache()
 
 
