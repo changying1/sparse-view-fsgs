@@ -190,6 +190,69 @@ def test_structural_promotion_attr_s_definition_excludes_redundancy():
     assert stats.promotion["mean_S_displaced"] == pytest.approx(0.3 + 0.5 + 0.5)
 
 
+def test_structural_promotion_attr_uses_actual_weighted_s_without_changing_selector():
+    boundary = torch.tensor([0.0, 0.3, 0.8, 0.1])
+    turning = torch.tensor([0.0, 0.5, 0.4, 0.2])
+    defect = torch.tensor([0.0, 0.5, 0.9, 0.2])
+    redundancy = torch.tensor([0.0, 0.6, 0.2, 0.7])
+    components = compute_structural_value_score(
+        boundary,
+        turning,
+        defect,
+        redundancy,
+        w_b=2.0,
+        w_k=3.0,
+        w_d=4.0,
+        low_quantile=0.0,
+        high_quantile=1.0,
+        return_components=True,
+    )
+    candidate_mask = torch.ones(4, dtype=torch.bool)
+    dist = torch.tensor([200.0, 100.0, 95.0, 1.0])
+
+    before_mask, before_stats = select_proximity_sources(
+        candidate_mask,
+        dist,
+        n=1,
+        rho=0.5,
+        enabled=True,
+        mode="value_demand_rerank",
+        value_score=components["U"],
+        rerank_fraction=0.5,
+        boundary_multiplier=2.0,
+        demand_ratio=0.90,
+    )
+    stats = compute_structural_value_attribution_stats(10, components, candidate_mask, before_stats)
+    after_mask, after_stats = select_proximity_sources(
+        candidate_mask,
+        dist,
+        n=1,
+        rho=0.5,
+        enabled=True,
+        mode="value_demand_rerank",
+        value_score=components["U"],
+        rerank_fraction=0.5,
+        boundary_multiplier=2.0,
+        demand_ratio=0.90,
+    )
+
+    weighted_s = 2.0 * components["B"] + 3.0 * components["K"] + 4.0 * components["D"]
+    unweighted_s = components["B"] + components["K"] + components["D"]
+    promoted = torch.as_tensor(before_stats.demand_promoted_indices, dtype=torch.long)
+    displaced = torch.as_tensor(before_stats.demand_displaced_indices, dtype=torch.long)
+
+    assert torch.allclose(components["S"], weighted_s)
+    assert not torch.allclose(components["S"], unweighted_s)
+    assert stats.promotion["mean_S_promoted"] == pytest.approx(float(weighted_s[promoted].mean().item()))
+    assert stats.promotion["mean_S_displaced"] == pytest.approx(float(weighted_s[displaced].mean().item()))
+    assert stats.promotion["mean_delta_S"] == pytest.approx(float((weighted_s[promoted] - weighted_s[displaced]).mean().item()))
+    assert stats.promotion["mean_delta_S"] != pytest.approx(float((unweighted_s[promoted] - unweighted_s[displaced]).mean().item()))
+    assert torch.equal(before_mask, after_mask)
+    assert before_stats.selected_indices == after_stats.selected_indices
+    assert before_stats.demand_promoted_indices == after_stats.demand_promoted_indices
+    assert before_stats.promotion_accepted == after_stats.promotion_accepted
+
+
 def test_structural_score_raw_exposure_does_not_change_u():
     boundary = torch.tensor([1.0, 2.0, 5.0])
     turning = torch.tensor([2.0, 4.0, 6.0])

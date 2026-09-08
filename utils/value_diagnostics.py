@@ -140,7 +140,7 @@ def format_obdkr_diagnostics_log(iteration, stats):
 
 @torch.no_grad()
 def compute_structural_value_attribution_stats(iteration, components, candidate_mask, budget_stats, eps=1e-8):
-    required = ("B_raw", "K_raw", "D_raw", "R_raw", "U")
+    required = ("B_raw", "K_raw", "D_raw", "R_raw", "S", "U")
     for name in required:
         if name not in components:
             raise ValueError(f"components missing '{name}'.")
@@ -149,6 +149,7 @@ def compute_structural_value_attribution_stats(iteration, components, candidate_
         "K": _component_tensor(components, "K"),
         "D": _component_tensor(components, "D"),
         "R": _component_tensor(components, "R"),
+        "S": components["S"],
         "U": components["U"],
     }
     n = normalized["U"].shape[0]
@@ -354,13 +355,12 @@ def _promotion_attribution_stats(normalized, promoted, displaced):
     has_pairs = promoted.numel() > 0 and displaced.numel() > 0
     if promoted.numel() != displaced.numel():
         raise ValueError("promoted and displaced indices must be paired.")
-    s = normalized["B"] + normalized["K"] + normalized["D"]
     values = {
         "B": normalized["B"],
         "K": normalized["K"],
         "D": normalized["D"],
         "R": normalized["R"],
-        "S": s,
+        "S": normalized["S"],
         "U": normalized["U"],
     }
     for prefix, tensor in values.items():
