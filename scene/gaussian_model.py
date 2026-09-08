@@ -20,11 +20,40 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation, chamfer_dist
+from utils.edge_support import aggregate_multiview_edge_support
+from utils.growth_budget import (
+    format_demand_preserve_diag,
+    format_proximity_budget_log,
+    format_proximity_capacity_log,
+    format_proximity_replay_log,
+    format_value_promotion_diag,
+    format_value_rerank_diag,
+    parse_proximity_action_replay,
+    requires_value_features,
+    select_proximity_sources,
+    resolve_proximity_selection_mode,
+)
 from utils.growth_diagnostics import (
     GrowthDiagnostics,
     count_proximity_proposed,
     count_split_candidates,
     format_proximity_growth_log,
+)
+from utils.structural_graph import (
+    build_knn_graph,
+    compute_continuity_defect,
+    compute_geometric_turning,
+    compute_redundancy,
+    estimate_gaussian_normals,
+)
+from utils.value_allocation import compute_obdkr_value, compute_structural_value_score
+from utils.value_diagnostics import (
+    compute_obdkr_diagnostics,
+    compute_structural_value_attribution_stats,
+    format_obdkr_diagnostics_log,
+    format_structural_boundary_diag,
+    format_structural_norm_diag,
+    format_structural_promotion_attr,
 )
 from torch.optim.lr_scheduler import MultiStepLR
 
@@ -68,6 +97,11 @@ class GaussianModel:
         self.setup_functions()
         self.bg_color = torch.empty(0)
         self.confidence = torch.empty(0)
+        self.visibility_history = None
+        self.visible_view_count = None
+        self.recent_visibility_history = None
+        self.recent_visible_view_count = None
+        self.camera_uid_to_train_index = None
 
     def capture(self):
         return (
@@ -83,9 +117,13 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._capture_visibility_state(),
         )
 
-    def restore(self, model_args, training_args):
+    def restore(self, model_args, training_args, restore_optimizer=False):
+        visibility_state = None
+        if len(model_args) == 13:
+            (*model_args, visibility_state) = model_args
         (self.active_sh_degree,
          self._xyz,
          self._features_dc,
@@ -101,7 +139,197 @@ class GaussianModel:
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        # self.optimizer.load_state_dict(opt_dict)
+        self._restore_visibility_state(visibility_state)
+        if restore_optimizer:
+            self.optimizer.load_state_dict(opt_dict)
+
+    def _capture_visibility_state(self):
+        return {
+            "visibility_history": self.visibility_history,
+            "visible_view_count": self.visible_view_count,
+        }
+
+    def _restore_visibility_state(self, state):
+        if not isinstance(state, dict):
+            self.visibility_history = None
+            self.visible_view_count = None
+            self.recent_visibility_history = None
+            self.recent_visible_view_count = None
+            return
+        self.visibility_history = state.get("visibility_history")
+        self.visible_view_count = state.get("visible_view_count")
+        self.recent_visibility_history = None
+        self.recent_visible_view_count = None
+        self._sync_visibility_shape(rebuild_missing=True)
+
+    def ensure_visibility_history(self, num_views):
+        count = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        if self.visibility_history is None:
+            self.visibility_history = torch.zeros((count, int(num_views)), dtype=torch.bool, device=device)
+            self.visible_view_count = torch.zeros((count,), dtype=torch.long, device=device)
+            self.recent_visibility_history = torch.zeros((count, int(num_views)), dtype=torch.bool, device=device)
+            self.recent_visible_view_count = torch.zeros((count,), dtype=torch.long, device=device)
+            return
+        if self.visibility_history.shape[0] != count:
+            raise ValueError("visibility_history first dimension must match current Gaussian count.")
+        if self.visibility_history.shape[1] != int(num_views):
+            raise ValueError("visibility_history second dimension must match training view count.")
+        self.visibility_history = self.visibility_history.to(device=device, dtype=torch.bool)
+        if self.visible_view_count is None or self.visible_view_count.shape[0] != count:
+            self.visible_view_count = self.visibility_history.sum(dim=1).to(dtype=torch.long)
+        else:
+            self.visible_view_count = self.visible_view_count.to(device=device, dtype=torch.long)
+        self._ensure_recent_visibility_history(num_views)
+
+    def update_visibility(self, view_id, visible_mask):
+        view_id = int(view_id)
+        if self.visibility_history is None:
+            self.ensure_visibility_history(view_id + 1)
+        if view_id < 0 or view_id >= self.visibility_history.shape[1]:
+            raise ValueError("view_id must be within visibility_history.")
+        mask = visible_mask.reshape(-1).to(device=self.get_xyz.device, dtype=torch.bool)
+        if mask.shape[0] != self.get_xyz.shape[0]:
+            raise ValueError("visible_mask length must match current Gaussian count.")
+        previous = self.visibility_history[:, view_id]
+        newly_visible = mask & ~previous
+        self.visibility_history[:, view_id] = previous | mask
+        if self.visible_view_count is None or self.visible_view_count.shape[0] != self.get_xyz.shape[0]:
+            self.visible_view_count = self.visibility_history.sum(dim=1).to(dtype=torch.long)
+        else:
+            self.visible_view_count += newly_visible.to(dtype=self.visible_view_count.dtype)
+        self._update_recent_visibility(view_id, mask)
+
+    def _sync_visibility_shape(self, rebuild_missing=False):
+        count = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        if self.visibility_history is not None:
+            self.visibility_history = self.visibility_history.to(device=device, dtype=torch.bool)
+            if self.visibility_history.shape[0] != count:
+                if rebuild_missing:
+                    self.visibility_history = None
+                    self.visible_view_count = None
+                else:
+                    raise ValueError("visibility_history is out of sync with Gaussian count.")
+        if self.visible_view_count is not None:
+            self.visible_view_count = self.visible_view_count.to(device=device, dtype=torch.long)
+            if self.visible_view_count.shape[0] != count:
+                if self.visibility_history is not None and self.visibility_history.shape[0] == count:
+                    self.visible_view_count = self.visibility_history.sum(dim=1).to(dtype=torch.long)
+                elif rebuild_missing:
+                    self.visible_view_count = None
+                else:
+                    raise ValueError("visible_view_count is out of sync with Gaussian count.")
+        if getattr(self, "recent_visibility_history", None) is not None:
+            self.recent_visibility_history = self.recent_visibility_history.to(device=device, dtype=torch.bool)
+            if self.recent_visibility_history.shape[0] != count:
+                if rebuild_missing:
+                    self.recent_visibility_history = None
+                    self.recent_visible_view_count = None
+                else:
+                    raise ValueError("recent_visibility_history is out of sync with Gaussian count.")
+        if getattr(self, "recent_visible_view_count", None) is not None:
+            self.recent_visible_view_count = self.recent_visible_view_count.to(device=device, dtype=torch.long)
+            if self.recent_visible_view_count.shape[0] != count:
+                if self.recent_visibility_history is not None and self.recent_visibility_history.shape[0] == count:
+                    self.recent_visible_view_count = self.recent_visibility_history.sum(dim=1).to(dtype=torch.long)
+                elif rebuild_missing:
+                    self.recent_visible_view_count = None
+                else:
+                    raise ValueError("recent_visible_view_count is out of sync with Gaussian count.")
+
+    def _ensure_recent_visibility_history(self, num_views):
+        count = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        num_views = int(num_views)
+        if getattr(self, "recent_visibility_history", None) is None:
+            self.recent_visibility_history = torch.zeros((count, num_views), dtype=torch.bool, device=device)
+            self.recent_visible_view_count = torch.zeros((count,), dtype=torch.long, device=device)
+            return
+        if self.recent_visibility_history.shape[0] != count:
+            raise ValueError("recent_visibility_history first dimension must match current Gaussian count.")
+        if self.recent_visibility_history.shape[1] != num_views:
+            raise ValueError("recent_visibility_history second dimension must match training view count.")
+        self.recent_visibility_history = self.recent_visibility_history.to(device=device, dtype=torch.bool)
+        if getattr(self, "recent_visible_view_count", None) is None or self.recent_visible_view_count.shape[0] != count:
+            self.recent_visible_view_count = self.recent_visibility_history.sum(dim=1).to(dtype=torch.long)
+        else:
+            self.recent_visible_view_count = self.recent_visible_view_count.to(device=device, dtype=torch.long)
+
+    def _update_recent_visibility(self, view_id, mask):
+        if getattr(self, "recent_visibility_history", None) is None:
+            self._ensure_recent_visibility_history(self.visibility_history.shape[1])
+        previous = self.recent_visibility_history[:, view_id]
+        newly_visible = mask & ~previous
+        self.recent_visibility_history[:, view_id] = previous | mask
+        if getattr(self, "recent_visible_view_count", None) is None or self.recent_visible_view_count.shape[0] != self.get_xyz.shape[0]:
+            self.recent_visible_view_count = self.recent_visibility_history.sum(dim=1).to(dtype=torch.long)
+        else:
+            self.recent_visible_view_count += newly_visible.to(dtype=self.recent_visible_view_count.dtype)
+
+    def reset_recent_visibility(self):
+        if getattr(self, "recent_visibility_history", None) is None:
+            if self.visibility_history is not None:
+                self._ensure_recent_visibility_history(self.visibility_history.shape[1])
+            return
+        self.recent_visibility_history.zero_()
+        if getattr(self, "recent_visible_view_count", None) is None or self.recent_visible_view_count.shape[0] != self.get_xyz.shape[0]:
+            self.recent_visible_view_count = self.recent_visibility_history.sum(dim=1).to(dtype=torch.long)
+        else:
+            self.recent_visible_view_count.zero_()
+
+    def _append_visibility_from_masks(self, source_mask, repeat_count=1, target_indices=None):
+        if self.visibility_history is None:
+            return
+        source_history = self.visibility_history[source_mask]
+        if target_indices is not None:
+            target_history = self.visibility_history[target_indices]
+            source_history = source_history[:, None, :].repeat(1, repeat_count, 1).reshape(-1, self.visibility_history.shape[1])
+            source_history = source_history | target_history
+        elif repeat_count != 1:
+            source_history = source_history.repeat(repeat_count, 1)
+        self.visibility_history = torch.cat((self.visibility_history, source_history), dim=0)
+        new_counts = source_history.sum(dim=1).to(dtype=torch.long)
+        if self.visible_view_count is None:
+            self.visible_view_count = self.visibility_history.sum(dim=1).to(dtype=torch.long)
+        else:
+            self.visible_view_count = torch.cat((self.visible_view_count, new_counts), dim=0)
+        if getattr(self, "recent_visibility_history", None) is not None:
+            recent_source_history = self.recent_visibility_history[source_mask]
+            if target_indices is not None:
+                recent_target_history = self.recent_visibility_history[target_indices]
+                recent_source_history = recent_source_history[:, None, :].repeat(
+                    1, repeat_count, 1
+                ).reshape(-1, self.recent_visibility_history.shape[1])
+                recent_source_history = recent_source_history | recent_target_history
+            elif repeat_count != 1:
+                recent_source_history = recent_source_history.repeat(repeat_count, 1)
+            self.recent_visibility_history = torch.cat((self.recent_visibility_history, recent_source_history), dim=0)
+            recent_new_counts = recent_source_history.sum(dim=1).to(dtype=torch.long)
+            if getattr(self, "recent_visible_view_count", None) is None:
+                self.recent_visible_view_count = self.recent_visibility_history.sum(dim=1).to(dtype=torch.long)
+            else:
+                self.recent_visible_view_count = torch.cat((self.recent_visible_view_count, recent_new_counts), dim=0)
+
+    def _prune_visibility(self, valid_points_mask):
+        if self.visibility_history is not None:
+            self.visibility_history = self.visibility_history[valid_points_mask]
+        if self.visible_view_count is not None:
+            self.visible_view_count = self.visible_view_count[valid_points_mask]
+        if getattr(self, "recent_visibility_history", None) is not None:
+            self.recent_visibility_history = self.recent_visibility_history[valid_points_mask]
+        if getattr(self, "recent_visible_view_count", None) is not None:
+            self.recent_visible_view_count = self.recent_visible_view_count[valid_points_mask]
+
+    def _resolve_value_observation_count(self, lifetime_count, recent_count):
+        observation_source = getattr(self.args, "value_observation_source", "lifetime")
+        if observation_source == "lifetime":
+            return lifetime_count, observation_source
+        if observation_source == "recent":
+            if recent_count is None:
+                raise ValueError("recent observation source requested but recent visibility state is unavailable")
+            return recent_count, observation_source
+        raise ValueError("value_observation_source must be one of lifetime, recent")
 
     @property
     def get_scaling(self):
@@ -169,8 +397,9 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        device = self.get_xyz.device
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=device)
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=device)
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -335,6 +564,7 @@ class GaussianModel:
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self._prune_visibility(valid_points_mask)
 
 
     def prune_points(self, mask, iter):
@@ -354,6 +584,7 @@ class GaussianModel:
             self.denom = self.denom[valid_points_mask]
             self.max_radii2D = self.max_radii2D[valid_points_mask]
             self.confidence = self.confidence[valid_points_mask]
+            self._prune_visibility(valid_points_mask)
 
 
     def cat_tensors_to_optimizer(self, tensors_dict):
@@ -407,11 +638,116 @@ class GaussianModel:
         self.confidence = torch.cat([self.confidence, torch.ones(new_opacities.shape, device="cuda")], 0)
 
 
-    def proximity(self, scene_extent, iteration=None, N = 3):
+    def compute_fsgs_proximity_candidate_value(
+        self,
+        train_cameras=None,
+        edge_maps=None,
+        candidate_mask=None,
+        iteration=None,
+        knn_k=12,
+        **kwargs,
+    ):
+        visible_count = self.visible_view_count
+        if visible_count is None:
+            visible_count = torch.zeros((self.get_xyz.shape[0],), dtype=torch.long, device=self.get_xyz.device)
+        visible_count = visible_count.reshape(-1).to(device=self.get_xyz.device, dtype=torch.float32)
+        if visible_count.shape[0] != self.get_xyz.shape[0]:
+            raise ValueError("visible_view_count must match current Gaussian count.")
+        raw_recent_visible_count = getattr(self, "recent_visible_view_count", None)
+        recent_visible_count = raw_recent_visible_count
+        if recent_visible_count is not None:
+            recent_visible_count = recent_visible_count.reshape(-1).to(device=self.get_xyz.device, dtype=torch.float32)
+        if recent_visible_count is not None and recent_visible_count.shape[0] != self.get_xyz.shape[0]:
+            raise ValueError("recent_visible_view_count must match current Gaussian count.")
+        value_score_variant = kwargs.get("value_score_variant", getattr(self.args, "value_score_variant", "obdkr"))
+        if value_score_variant not in ("obdkr", "structural"):
+            raise ValueError("value_score_variant must be one of obdkr, structural")
+        observation_source = getattr(self.args, "value_observation_source", "lifetime")
+        active_observation_count = None
+        if value_score_variant == "obdkr":
+            active_observation_count, observation_source = self._resolve_value_observation_count(
+                visible_count,
+                recent_visible_count,
+            )
+
+        if train_cameras is not None and edge_maps is not None:
+            boundary = aggregate_multiview_edge_support(
+                xyz=self.get_xyz.detach(),
+                cameras=train_cameras,
+                edge_maps=edge_maps,
+                visibility_history=self.visibility_history,
+                camera_uid_to_train_index=self.camera_uid_to_train_index,
+            )
+        else:
+            boundary = torch.zeros((self.get_xyz.shape[0],), dtype=torch.float32, device=self.get_xyz.device)
+
+        neighbors = build_knn_graph(self.get_xyz.detach(), k=knn_k)
+        normals = estimate_gaussian_normals(self.get_scaling.detach(), self._rotation.detach())
+        turning = compute_geometric_turning(self.get_xyz.detach(), normals, neighbors)
+        defect = compute_continuity_defect(self.get_xyz.detach(), normals, neighbors)
+        redundancy = compute_redundancy(self.get_xyz.detach(), self.get_scaling.detach(), neighbors)
+        value_kwargs = dict(
+            w_b=kwargs.get("w_b", getattr(self.args, "value_w_b", 1.0)),
+            w_k=kwargs.get("w_k", getattr(self.args, "value_w_k", 1.0)),
+            w_d=kwargs.get("w_d", getattr(self.args, "value_w_d", 1.0)),
+            lambda_r=kwargs.get("lambda_r", getattr(self.args, "value_lambda_r", 1.0)),
+            low_quantile=kwargs.get("low_quantile", getattr(self.args, "normalization_low_quantile", 0.05)),
+            high_quantile=kwargs.get("high_quantile", getattr(self.args, "normalization_high_quantile", 0.95)),
+            normalization_mask=candidate_mask,
+            return_components=True,
+        )
+        if value_score_variant == "obdkr":
+            components = compute_obdkr_value(
+                active_observation_count,
+                boundary,
+                turning,
+                defect,
+                redundancy,
+                tau_e=kwargs.get("tau_e", getattr(self.args, "value_tau_e", 1.0)),
+                tau_s=kwargs.get("tau_s", getattr(self.args, "value_tau_s", 3.0)),
+                **value_kwargs,
+            )
+        else:
+            components = compute_structural_value_score(
+                boundary,
+                turning,
+                defect,
+                redundancy,
+                **value_kwargs,
+            )
+        if iteration is not None:
+            print(
+                format_obdkr_diagnostics_log(
+                    iteration,
+                    compute_obdkr_diagnostics(
+                        components,
+                        candidate_mask,
+                        observation_count=visible_count,
+                        recent_observation_count=(
+                            recent_visible_count
+                            if recent_visible_count is not None
+                            else torch.zeros((self.get_xyz.shape[0],), dtype=torch.float32, device=self.get_xyz.device)
+                        ),
+                        active_observation_count=active_observation_count,
+                        observation_source=observation_source,
+                        value_score_variant=value_score_variant,
+                        num_train_views=(
+                            self.recent_visibility_history.shape[1]
+                            if getattr(self, "recent_visibility_history", None) is not None
+                            else None
+                        ),
+                    ),
+                ),
+                flush=True,
+            )
+        return components
+
+    def proximity(self, scene_extent, iteration=None, N = 3, train_cameras=None, edge_maps=None):
         dist, nearest_indices = distCUDA2(self.get_xyz)
         selected_pts_mask = torch.logical_and(dist > (5. * scene_extent),
                                               torch.max(self.get_scaling, dim=1).values > (scene_extent))
         proximity_sources = int(selected_pts_mask.sum().item())
+        proximity_candidate_mask = selected_pts_mask
         proximity_proposed = count_proximity_proposed(proximity_sources, N)
         print(
             format_proximity_growth_log(
@@ -422,9 +758,79 @@ class GaussianModel:
             ),
             flush=True,
         )
+        value_score = None
+        replay_schedule = parse_proximity_action_replay(getattr(self.args, "proximity_action_replay", ""))
+        replay_enabled = bool(replay_schedule)
+        proximity_selection_mode = resolve_proximity_selection_mode(
+            getattr(self.args, "proximity_selection_mode", "original"),
+            getattr(self.args, "enable_proximity_budget", False)
+            or getattr(self.args, "enable_proximity_candidate_capacity", False)
+            or replay_enabled,
+        )
+        if requires_value_features(proximity_selection_mode):
+            value_components = self.compute_fsgs_proximity_candidate_value(
+                train_cameras=train_cameras,
+                edge_maps=edge_maps,
+                candidate_mask=selected_pts_mask,
+                iteration=iteration,
+                tau_e=getattr(self.args, "value_tau_e", 1.0),
+                tau_s=getattr(self.args, "value_tau_s", 3.0),
+                w_b=getattr(self.args, "value_w_b", 1.0),
+                w_k=getattr(self.args, "value_w_k", 1.0),
+                w_d=getattr(self.args, "value_w_d", 1.0),
+                lambda_r=getattr(self.args, "value_lambda_r", 1.0),
+                low_quantile=getattr(self.args, "normalization_low_quantile", 0.05),
+                high_quantile=getattr(self.args, "normalization_high_quantile", 0.95),
+                value_score_variant=getattr(self.args, "value_score_variant", "obdkr"),
+                knn_k=getattr(self.args, "knn_k", 12),
+            )
+            value_score = value_components["U"]
+        selected_pts_mask, budget_stats = select_proximity_sources(
+            selected_pts_mask,
+            dist,
+            n=N,
+            rho=getattr(self.args, "proximity_growth_ratio", 0.10),
+            enabled=getattr(self.args, "enable_proximity_budget", False),
+            mode=proximity_selection_mode,
+            value_score=value_score,
+            rerank_fraction=getattr(self.args, "value_rerank_fraction", 0.25),
+            boundary_multiplier=getattr(self.args, "value_boundary_multiplier", 2.0),
+            demand_ratio=getattr(self.args, "value_demand_ratio", 0.90),
+            candidate_capacity_enabled=getattr(self.args, "enable_proximity_candidate_capacity", False),
+            candidate_keep_ratio=getattr(self.args, "proximity_candidate_keep_ratio", 0.80),
+            replay_schedule=replay_schedule,
+            iteration=iteration,
+        )
+        print(format_proximity_budget_log(iteration, budget_stats), flush=True)
+        if budget_stats.capacity_active:
+            print(format_proximity_capacity_log(iteration, budget_stats), flush=True)
+        if budget_stats.replay_active:
+            print(format_proximity_replay_log(iteration, budget_stats), flush=True)
+        print(format_value_rerank_diag(iteration, budget_stats), flush=True)
+        capacity_limited = budget_stats.budget_hit or budget_stats.capacity_hit or (
+            budget_stats.replay_active and budget_stats.selected_src < budget_stats.candidates
+        )
+        if capacity_limited and budget_stats.mode == "value_rerank":
+            budget_stats.proximity_values = dist
+            budget_stats.value_values = value_score
+            print(format_value_promotion_diag(iteration, budget_stats), flush=True)
+        if capacity_limited and budget_stats.mode == "value_demand_rerank":
+            budget_stats.proximity_values = dist
+            budget_stats.value_values = value_score
+            print(format_demand_preserve_diag(iteration, budget_stats), flush=True)
+            if getattr(self.args, "value_score_variant", "obdkr") == "structural":
+                structural_stats = compute_structural_value_attribution_stats(
+                    iteration,
+                    value_components,
+                    proximity_candidate_mask,
+                    budget_stats,
+                )
+                print(format_structural_norm_diag(structural_stats), flush=True)
+                print(format_structural_boundary_diag(structural_stats), flush=True)
+                print(format_structural_promotion_attr(structural_stats), flush=True)
 
         new_indices = nearest_indices[selected_pts_mask].reshape(-1).long()
-        source_xyz = self._xyz[selected_pts_mask].repeat(1, N, 1).reshape(-1, 3)
+        source_xyz = self._xyz[selected_pts_mask][:, None, :].repeat(1, N, 1).reshape(-1, 3)
         target_xyz = self._xyz[new_indices]
         new_xyz = (source_xyz + target_xyz) / 2
         new_scaling = self._scaling[new_indices]
@@ -434,7 +840,8 @@ class GaussianModel:
         new_features_rest = torch.zeros_like(self._features_rest[new_indices])
         new_opacity = self._opacity[new_indices]
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
-        return proximity_sources, proximity_proposed
+        self._append_visibility_from_masks(selected_pts_mask, repeat_count=N, target_indices=new_indices)
+        return proximity_sources, proximity_proposed, budget_stats.selected_src, budget_stats.selected_new
 
 
 
@@ -468,6 +875,7 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self._append_visibility_from_masks(selected_pts_mask, repeat_count=N)
 
         prune_filter = torch.cat(
             (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -492,10 +900,11 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
                                    new_rotation)
+        self._append_visibility_from_masks(selected_pts_mask)
         return clone_candidates
 
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iter):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iter, train_cameras=None, edge_maps=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
         growth_diag = GrowthDiagnostics(iteration=iter, num_before=self.get_xyz.shape[0])
@@ -509,7 +918,12 @@ class GaussianModel:
         ) = self.densify_and_split(grads, max_grad, extent, iter)
         growth_diag.num_after_split = self.get_xyz.shape[0]
         if iter < 2000:
-            growth_diag.proximity_sources, growth_diag.proximity_proposed = self.proximity(extent, iteration=iter)
+            (
+                growth_diag.proximity_sources,
+                growth_diag.proximity_proposed,
+                growth_diag.proximity_selected_sources,
+                growth_diag.proximity_selected_new,
+            ) = self.proximity(extent, iteration=iter, train_cameras=train_cameras, edge_maps=edge_maps)
         growth_diag.num_after_proximity = self.get_xyz.shape[0]
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()

@@ -27,6 +27,13 @@ from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
+from utils.edge_support import compute_edge_map
+from utils.growth_budget import requires_value_features, resolve_proximity_selection_mode
+from utils.paired_fork_checkpoint import (
+    load_paired_fork_checkpoint,
+    next_iteration_after_paired_fork,
+    save_paired_fork_checkpoint,
+)
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -39,13 +46,31 @@ def training(dataset, opt, pipe, args):
     testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from = args.test_iterations, \
             args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from
     first_iter = 0
+    paired_fork_resumed_from = None
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(args)
     scene = Scene(args, gaussians, shuffle=False)
     gaussians.training_setup(opt)
-    if checkpoint:
+    if args.paired_fork_checkpoint:
+        first_iter = load_paired_fork_checkpoint(args.paired_fork_checkpoint, gaussians, opt)
+        paired_fork_resumed_from = first_iter
+    elif checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    train_cameras = scene.getTrainCameras()
+    gaussians.ensure_visibility_history(len(train_cameras))
+    gaussians.camera_uid_to_train_index = {
+        getattr(camera, "uid", index): index
+        for index, camera in enumerate(train_cameras)
+    }
+    proximity_selection_mode = resolve_proximity_selection_mode(
+        getattr(args, "proximity_selection_mode", "original"),
+        getattr(args, "enable_proximity_budget", False)
+        or getattr(args, "enable_proximity_candidate_capacity", False),
+    )
+    value_edge_maps = None
+    if requires_value_features(proximity_selection_mode):
+        value_edge_maps = initialize_value_edge_maps(train_cameras)
 
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -59,6 +84,13 @@ def training(dataset, opt, pipe, args):
     ema_loss_for_log = 0.0
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
+        if paired_fork_resumed_from is not None and iteration == next_iteration_after_paired_fork(paired_fork_resumed_from):
+            print(
+                "[PairedForkResume] "
+                f"iter={iteration} "
+                f"gaussians={gaussians.get_xyz.shape[0]}",
+                flush=True,
+            )
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -84,11 +116,16 @@ def training(dataset, opt, pipe, args):
 
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_stack = train_cameras.copy()
 
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        if hasattr(viewpoint_cam, "uid"):
+            train_view_index = gaussians.camera_uid_to_train_index[viewpoint_cam.uid]
+        else:
+            train_view_index = train_cameras.index(viewpoint_cam)
+        gaussians.update_visibility(train_view_index, visibility_filter)
 
 
         # Loss
@@ -162,7 +199,16 @@ def training(dataset, opt, pipe, args):
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.prune_threshold, scene.cameras_extent, size_threshold, iteration)
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold,
+                        opt.prune_threshold,
+                        scene.cameras_extent,
+                        size_threshold,
+                        iteration,
+                        train_cameras=train_cameras,
+                        edge_maps=value_edge_maps,
+                    )
+                    gaussians.reset_recent_visibility()
 
 
             # Optimizer step
@@ -174,6 +220,13 @@ def training(dataset, opt, pipe, args):
             if (iteration - args.start_sample_pseudo - 1) % opt.opacity_reset_interval == 0 and \
                     iteration > args.start_sample_pseudo:
                 gaussians.reset_opacity()
+
+            if iteration == args.paired_fork_save_iteration:
+                save_paired_fork_checkpoint(
+                    os.path.join(scene.model_path, f"paired_chkpnt{iteration}.pth"),
+                    gaussians,
+                    iteration,
+                )
 
 
 def prepare_output_and_logger(args):
@@ -197,6 +250,11 @@ def prepare_output_and_logger(args):
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
+
+
+def initialize_value_edge_maps(train_cameras):
+    with torch.no_grad():
+        return [compute_edge_map(camera.original_image.cuda()) for camera in train_cameras]
 
 
 
@@ -262,6 +320,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[50_00, 10_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--paired_fork_save_iteration", type=int, default=-1)
+    parser.add_argument("--paired_fork_checkpoint", type=str, default=None)
     parser.add_argument("--train_bg", action="store_true")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

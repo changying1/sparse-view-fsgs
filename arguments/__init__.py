@@ -13,6 +13,8 @@ from argparse import ArgumentParser, Namespace
 import sys
 import os
 
+from utils.growth_budget import parse_proximity_action_replay
+
 class GroupParams:
     pass
 
@@ -95,9 +97,86 @@ class OptimizationParams(ParamGroup):
         self.end_sample_pseudo = 9500
         self.sample_pseudo_interval = 10
         self.dist_thres = 10.
+        self.enable_proximity_budget = False
+        self.proximity_growth_ratio = 0.10
+        self.enable_proximity_candidate_capacity = False
+        self.proximity_candidate_keep_ratio = 0.80
+        self.proximity_action_replay = ""
+        self.proximity_selection_mode = "original"
+        self.value_rerank_fraction = 0.25
+        self.value_boundary_multiplier = 2.0
+        self.value_demand_ratio = 0.90
+        self.value_tau_e = 1.0
+        self.value_tau_s = 3.0
+        self.value_observation_source = "lifetime"
+        self.value_score_variant = "obdkr"
+        self.value_w_b = 1.0
+        self.value_w_k = 1.0
+        self.value_w_d = 1.0
+        self.value_lambda_r = 1.0
+        self.normalization_low_quantile = 0.05
+        self.normalization_high_quantile = 0.95
+        self.knn_k = 12
         self.depth_weight = 0.05
         self.depth_pseudo_weight = 0.5
         super().__init__(parser, "Optimization Parameters")
+
+    def extract(self, args):
+        g = super().extract(args)
+        validate_optimization_params(g)
+        return g
+
+
+def validate_optimization_params(args):
+    mode = getattr(args, "proximity_selection_mode", "original")
+    valid_modes = ("original", "proximity_topk", "value_global", "value_rerank", "value_demand_rerank")
+    if mode not in valid_modes:
+        raise ValueError(
+            "proximity_selection_mode must be one of "
+            "original, proximity_topk, value_global, value_rerank, value_demand_rerank"
+        )
+    budget_enabled = bool(getattr(args, "enable_proximity_budget", False))
+    candidate_capacity_enabled = bool(getattr(args, "enable_proximity_candidate_capacity", False))
+    replay_schedule = parse_proximity_action_replay(getattr(args, "proximity_action_replay", ""))
+    replay_enabled = bool(replay_schedule)
+    if sum(int(flag) for flag in (budget_enabled, candidate_capacity_enabled, replay_enabled)) > 1:
+        raise ValueError(
+            "enable_proximity_budget, enable_proximity_candidate_capacity, "
+            "and proximity_action_replay are mutually exclusive; cannot both be enabled"
+        )
+    if not candidate_capacity_enabled and not replay_enabled and not (
+        0 < float(getattr(args, "proximity_growth_ratio", 0.10)) <= 1
+    ):
+        raise ValueError("proximity_growth_ratio must satisfy 0 < proximity_growth_ratio <= 1")
+    if candidate_capacity_enabled and not (
+        0 < float(getattr(args, "proximity_candidate_keep_ratio", 0.80)) <= 1
+    ):
+        raise ValueError("proximity_candidate_keep_ratio must satisfy 0 < ratio <= 1")
+    if not (0 <= float(getattr(args, "value_rerank_fraction", 0.25)) <= 1):
+        raise ValueError("value_rerank_fraction must satisfy 0 <= value_rerank_fraction <= 1")
+    if float(getattr(args, "value_boundary_multiplier", 2.0)) < 1:
+        raise ValueError("value_boundary_multiplier must be at least 1")
+    if not (0 < float(getattr(args, "value_demand_ratio", 0.90)) <= 1):
+        raise ValueError("value_demand_ratio must satisfy 0 < value_demand_ratio <= 1")
+    if float(getattr(args, "value_tau_e", 1.0)) <= 0:
+        raise ValueError("value_tau_e must be positive")
+    if float(getattr(args, "value_tau_s", 3.0)) <= 0:
+        raise ValueError("value_tau_s must be positive")
+    observation_source = getattr(args, "value_observation_source", "lifetime")
+    if observation_source not in ("lifetime", "recent"):
+        raise ValueError("value_observation_source must be one of lifetime, recent")
+    score_variant = getattr(args, "value_score_variant", "obdkr")
+    if score_variant not in ("obdkr", "structural"):
+        raise ValueError("value_score_variant must be one of obdkr, structural")
+    if float(getattr(args, "value_lambda_r", 1.0)) < 0:
+        raise ValueError("value_lambda_r must be non-negative")
+    low = float(getattr(args, "normalization_low_quantile", 0.05))
+    high = float(getattr(args, "normalization_high_quantile", 0.95))
+    if not (0 <= low < high <= 1):
+        raise ValueError("normalization quantiles must satisfy 0 <= low < high <= 1")
+    if int(getattr(args, "knn_k", 12)) < 1:
+        raise ValueError("knn_k must be at least 1")
+    return args
 
 
 def get_combined_args(parser : ArgumentParser):

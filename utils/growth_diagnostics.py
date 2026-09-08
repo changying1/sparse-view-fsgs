@@ -25,7 +25,7 @@ def format_proximity_growth_log(iteration, num_before, proximity_sources, proxim
         f"[GrowthDiagProximity] iter={iteration} "
         f"before={num_before} "
         f"proximity_src={proximity_sources} "
-        f"proximity_new={proximity_proposed}"
+        f"proximity_proposed={proximity_proposed}"
     )
 
 
@@ -39,6 +39,8 @@ class GrowthDiagnostics:
     split_total_candidates: int = 0
     proximity_sources: int = 0
     proximity_proposed: int = 0
+    proximity_selected_sources: int = 0
+    proximity_selected_new: int = 0
     num_after_clone: int = 0
     num_after_split: int = 0
     num_after_proximity: int = 0
@@ -57,7 +59,9 @@ class GrowthDiagnostics:
             f"split_sparse={self.split_sparse_candidates} "
             f"split_total={self.split_total_candidates} "
             f"proximity_src={self.proximity_sources} "
-            f"proximity_new={self.proximity_proposed} "
+            f"proximity_proposed={self.proximity_proposed} "
+            f"proximity_selected_src={self.proximity_selected_sources} "
+            f"proximity_new={self.proximity_selected_new} "
             f"after_clone={self.num_after_clone} "
             f"after_split={self.num_after_split} "
             f"after_proximity={self.num_after_proximity} "

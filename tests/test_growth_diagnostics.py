@@ -34,7 +34,7 @@ def test_proximity_growth_log_format_is_oom_safe_line():
         proximity_proposed=15,
     ) == (
         "[GrowthDiagProximity] iter=600 before=19397 "
-        "proximity_src=5 proximity_new=15"
+        "proximity_src=5 proximity_proposed=15"
     )
 
 
@@ -43,9 +43,14 @@ def test_net_growth_uses_after_prune_minus_before():
         iteration=600,
         num_before=10,
         num_after_prune=14,
+        proximity_proposed=12,
+        proximity_selected_sources=2,
+        proximity_selected_new=6,
     )
 
     assert diagnostics.net_growth == 4
+    assert "proximity_proposed=12" in diagnostics.format_log()
+    assert "proximity_new=6" in diagnostics.format_log()
     assert "net=4" in diagnostics.format_log()
 
 
