@@ -121,6 +121,7 @@ class OptimizationParams(ParamGroup):
         self.enable_child_structure_diagnostics = False
         self.enable_structural_child_target_selection = False
         self.enable_observation_evidence_diagnostics = False
+        self.enable_rgg_diagnostics = False
         self.normalization_low_quantile = 0.05
         self.normalization_high_quantile = 0.95
         self.knn_k = 12

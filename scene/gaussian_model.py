@@ -127,6 +127,13 @@ class GaussianModel:
         self.recent_visibility_history = None
         self.recent_visible_view_count = None
         self.camera_uid_to_train_index = None
+        self.rgg_enabled = bool(getattr(args, "enable_rgg_diagnostics", False))
+        self.rgg_uid = torch.empty(0, dtype=torch.long)
+        self.rgg_birth_iter = torch.empty(0, dtype=torch.long)
+        self.rgg_source_uid = torch.empty(0, dtype=torch.long)
+        self.rgg_target_uid = torch.empty(0, dtype=torch.long)
+        self.rgg_generation = torch.empty(0, dtype=torch.long)
+        self.rgg_next_uid = 0
 
     def capture(self):
         return (
@@ -165,6 +172,7 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self._restore_visibility_state(visibility_state)
+        self._ensure_rgg_state(birth_iter=-1)
         if restore_optimizer:
             self.optimizer.load_state_dict(opt_dict)
 
@@ -346,6 +354,166 @@ class GaussianModel:
         if getattr(self, "recent_visible_view_count", None) is not None:
             self.recent_visible_view_count = self.recent_visible_view_count[valid_points_mask]
 
+    def _rgg_is_enabled(self):
+        return bool(getattr(self, "rgg_enabled", False) or getattr(self.args, "enable_rgg_diagnostics", False))
+
+    def _empty_rgg_tensor(self, device=None):
+        if device is None:
+            device = self.get_xyz.device if self.get_xyz.numel() else torch.device("cpu")
+        return torch.empty((0,), dtype=torch.long, device=device)
+
+    def _set_empty_rgg_state(self, device=None):
+        self.rgg_uid = self._empty_rgg_tensor(device)
+        self.rgg_birth_iter = self._empty_rgg_tensor(device)
+        self.rgg_source_uid = self._empty_rgg_tensor(device)
+        self.rgg_target_uid = self._empty_rgg_tensor(device)
+        self.rgg_generation = self._empty_rgg_tensor(device)
+        self.rgg_next_uid = 0
+
+    def _initialize_rgg_roots(self, birth_iter=0):
+        if not self._rgg_is_enabled():
+            return
+        count = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        self.rgg_uid = torch.arange(count, dtype=torch.long, device=device)
+        self.rgg_birth_iter = torch.full((count,), int(birth_iter), dtype=torch.long, device=device)
+        self.rgg_source_uid = torch.full((count,), -1, dtype=torch.long, device=device)
+        self.rgg_target_uid = torch.full((count,), -1, dtype=torch.long, device=device)
+        self.rgg_generation = torch.zeros((count,), dtype=torch.long, device=device)
+        self.rgg_next_uid = int(count)
+
+    def _ensure_rgg_state(self, birth_iter=-1):
+        if not self._rgg_is_enabled():
+            self._set_empty_rgg_state()
+            return
+        count = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        fields = (
+            getattr(self, "rgg_uid", None),
+            getattr(self, "rgg_birth_iter", None),
+            getattr(self, "rgg_source_uid", None),
+            getattr(self, "rgg_target_uid", None),
+            getattr(self, "rgg_generation", None),
+        )
+        if any((not torch.is_tensor(field)) or field.shape[0] != count for field in fields):
+            self._initialize_rgg_roots(birth_iter=birth_iter)
+            return
+        self.rgg_uid = self.rgg_uid.to(device=device, dtype=torch.long)
+        self.rgg_birth_iter = self.rgg_birth_iter.to(device=device, dtype=torch.long)
+        self.rgg_source_uid = self.rgg_source_uid.to(device=device, dtype=torch.long)
+        self.rgg_target_uid = self.rgg_target_uid.to(device=device, dtype=torch.long)
+        self.rgg_generation = self.rgg_generation.to(device=device, dtype=torch.long)
+        used_next = int(self.rgg_uid.max().item()) + 1 if count else 0
+        self.rgg_next_uid = max(int(getattr(self, "rgg_next_uid", 0)), used_next)
+
+    def _allocate_rgg_uids(self, count, device):
+        start = int(getattr(self, "rgg_next_uid", 0))
+        uids = torch.arange(start, start + int(count), dtype=torch.long, device=device)
+        self.rgg_next_uid = start + int(count)
+        return uids
+
+    def _build_rgg_children_from_indices(self, source_indices, target_indices=None, birth_iter=0):
+        if not self._rgg_is_enabled():
+            return None
+        self._ensure_rgg_state()
+        device = self.get_xyz.device
+        source_indices = source_indices.reshape(-1).to(device=device, dtype=torch.long)
+        child_count = source_indices.shape[0]
+        source_uid = self.rgg_uid[source_indices]
+        source_generation = self.rgg_generation[source_indices]
+        if target_indices is None:
+            target_uid = torch.full((child_count,), -1, dtype=torch.long, device=device)
+            generation = source_generation + 1
+        else:
+            target_indices = target_indices.reshape(-1).to(device=device, dtype=torch.long)
+            if target_indices.shape[0] != child_count:
+                raise ValueError("RGG target_indices length must match source_indices length.")
+            target_uid = self.rgg_uid[target_indices]
+            target_generation = self.rgg_generation[target_indices]
+            generation = torch.maximum(source_generation, target_generation) + 1
+        return {
+            "uid": self._allocate_rgg_uids(child_count, device),
+            "birth_iter": torch.full((child_count,), int(birth_iter), dtype=torch.long, device=device),
+            "source_uid": source_uid.clone(),
+            "target_uid": target_uid.clone(),
+            "generation": generation.clone(),
+        }
+
+    def _append_rgg_metadata(self, child_metadata):
+        if not self._rgg_is_enabled():
+            return
+        if child_metadata is None:
+            raise ValueError("RGG metadata is required when RGG diagnostics are enabled.")
+        expected = child_metadata["uid"].shape[0]
+        if self.rgg_uid.shape[0] + expected != self.get_xyz.shape[0]:
+            raise ValueError("RGG parent and child metadata counts must match Gaussian count.")
+        if child_metadata["uid"].shape[0] != expected:
+            raise ValueError("RGG child metadata count must match appended Gaussian count.")
+        self.rgg_uid = torch.cat((self.rgg_uid, child_metadata["uid"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
+        self.rgg_birth_iter = torch.cat((self.rgg_birth_iter, child_metadata["birth_iter"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
+        self.rgg_source_uid = torch.cat((self.rgg_source_uid, child_metadata["source_uid"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
+        self.rgg_target_uid = torch.cat((self.rgg_target_uid, child_metadata["target_uid"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
+        self.rgg_generation = torch.cat((self.rgg_generation, child_metadata["generation"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
+        self._assert_rgg_aligned()
+
+    def _prune_rgg_metadata(self, valid_points_mask):
+        if not self._rgg_is_enabled():
+            return
+        valid_points_mask = valid_points_mask.to(device=self.rgg_uid.device, dtype=torch.bool)
+        self.rgg_uid = self.rgg_uid[valid_points_mask]
+        self.rgg_birth_iter = self.rgg_birth_iter[valid_points_mask]
+        self.rgg_source_uid = self.rgg_source_uid[valid_points_mask]
+        self.rgg_target_uid = self.rgg_target_uid[valid_points_mask]
+        self.rgg_generation = self.rgg_generation[valid_points_mask]
+        self._assert_rgg_aligned()
+
+    def _assert_rgg_aligned(self):
+        if not self._rgg_is_enabled():
+            return
+        count = self.get_xyz.shape[0]
+        for field_name in ("rgg_uid", "rgg_birth_iter", "rgg_source_uid", "rgg_target_uid", "rgg_generation"):
+            field = getattr(self, field_name)
+            if field.shape[0] != count:
+                raise ValueError(f"{field_name} first dimension must match Gaussian count.")
+
+    def capture_rgg_state(self):
+        if not self._rgg_is_enabled():
+            return None
+        self._ensure_rgg_state()
+        return {
+            "enabled": True,
+            "uid": self.rgg_uid.detach().cpu(),
+            "birth_iter": self.rgg_birth_iter.detach().cpu(),
+            "source_uid": self.rgg_source_uid.detach().cpu(),
+            "target_uid": self.rgg_target_uid.detach().cpu(),
+            "generation": self.rgg_generation.detach().cpu(),
+            "next_uid": int(self.rgg_next_uid),
+        }
+
+    def restore_rgg_state(self, state):
+        if not self._rgg_is_enabled():
+            self._set_empty_rgg_state()
+            return
+        if state is None:
+            self._initialize_rgg_roots(birth_iter=-1)
+            return
+        required = ("uid", "birth_iter", "source_uid", "target_uid", "generation")
+        if not isinstance(state, dict) or any(key not in state for key in required):
+            raise ValueError("paired fork checkpoint RGG state is malformed.")
+        expected_count = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        for key in required:
+            if not torch.is_tensor(state[key]) or state[key].shape[0] != expected_count:
+                raise ValueError(f"paired fork checkpoint RGG {key} first dimension must match Gaussian count.")
+        self.rgg_uid = state["uid"].to(device=device, dtype=torch.long)
+        self.rgg_birth_iter = state["birth_iter"].to(device=device, dtype=torch.long)
+        self.rgg_source_uid = state["source_uid"].to(device=device, dtype=torch.long)
+        self.rgg_target_uid = state["target_uid"].to(device=device, dtype=torch.long)
+        self.rgg_generation = state["generation"].to(device=device, dtype=torch.long)
+        used_next = int(self.rgg_uid.max().item()) + 1 if expected_count else 0
+        self.rgg_next_uid = max(int(state.get("next_uid", 0)), used_next)
+        self._assert_rgg_aligned()
+
     def _resolve_value_observation_count(self, lifetime_count, recent_count):
         observation_source = getattr(self.args, "value_observation_source", "lifetime")
         if observation_source == "lifetime":
@@ -414,6 +582,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.confidence = torch.ones_like(opacities, device="cuda")
+        self._initialize_rgg_roots(birth_iter=0)
         if self.args.train_bg:
             self.bg_color = nn.Parameter((torch.zeros(3, 1, 1) + 0.).cuda().requires_grad_(True))
 
@@ -538,6 +707,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
+        self._initialize_rgg_roots(birth_iter=0)
 
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -590,6 +760,7 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self._prune_visibility(valid_points_mask)
+        self._prune_rgg_metadata(valid_points_mask)
 
 
     def prune_points(self, mask, iter):
@@ -610,6 +781,7 @@ class GaussianModel:
             self.max_radii2D = self.max_radii2D[valid_points_mask]
             self.confidence = self.confidence[valid_points_mask]
             self._prune_visibility(valid_points_mask)
+            self._prune_rgg_metadata(valid_points_mask)
 
 
     def cat_tensors_to_optimizer(self, tensors_dict):
@@ -641,7 +813,7 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation):
+                              new_rotation, rgg_child_metadata=None):
         d = {"xyz": new_xyz,
              "f_dc": new_features_dc,
              "f_rest": new_features_rest,
@@ -657,10 +829,12 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.confidence = torch.cat([self.confidence, torch.ones(new_opacities.shape, device="cuda")], 0)
+        device = self.get_xyz.device
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=device)
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=device)
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=device)
+        self.confidence = torch.cat([self.confidence, torch.ones(new_opacities.shape, device=device)], 0)
+        self._append_rgg_metadata(rgg_child_metadata)
 
 
     def compute_fsgs_proximity_candidate_value(
@@ -1091,6 +1265,17 @@ class GaussianModel:
             )
 
         new_indices = target_indices.reshape(-1).long()
+        rgg_child_metadata = None
+        if self._rgg_is_enabled():
+            source_indices = selected_pts_mask.nonzero(as_tuple=False).reshape(-1).long()
+            rgg_source_indices = source_indices[:, None].repeat(1, N).reshape(-1)
+            if rgg_source_indices.numel() != new_indices.numel():
+                raise ValueError("RGG proximity source/target metadata count mismatch.")
+            rgg_child_metadata = self._build_rgg_children_from_indices(
+                rgg_source_indices,
+                target_indices=new_indices,
+                birth_iter=iteration if iteration is not None else 0,
+            )
         source_xyz = self._xyz[selected_pts_mask][:, None, :].repeat(1, N, 1).reshape(-1, 3)
         target_xyz = self._xyz[new_indices]
         new_xyz = (source_xyz + target_xyz) / 2
@@ -1100,7 +1285,25 @@ class GaussianModel:
         new_features_dc = torch.zeros_like(self._features_dc[new_indices])
         new_features_rest = torch.zeros_like(self._features_rest[new_indices])
         new_opacity = self._opacity[new_indices]
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        if self._rgg_is_enabled():
+            self.densification_postfix(
+                new_xyz,
+                new_features_dc,
+                new_features_rest,
+                new_opacity,
+                new_scaling,
+                new_rotation,
+                rgg_child_metadata=rgg_child_metadata,
+            )
+        else:
+            self.densification_postfix(
+                new_xyz,
+                new_features_dc,
+                new_features_rest,
+                new_opacity,
+                new_scaling,
+                new_rotation,
+            )
         self._append_visibility_from_masks(selected_pts_mask, repeat_count=N, target_indices=new_indices)
         return proximity_sources, proximity_proposed, budget_stats.selected_src, budget_stats.selected_new
 
@@ -1109,7 +1312,8 @@ class GaussianModel:
     def densify_and_split(self, grads, grad_threshold, scene_extent, iter, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
-        padded_grad = torch.zeros((n_init_points), device="cuda")
+        device = self.get_xyz.device
+        padded_grad = torch.zeros((n_init_points), device=device)
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -1134,17 +1338,36 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
-
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        if self._rgg_is_enabled():
+            source_indices = selected_pts_mask.nonzero(as_tuple=False).reshape(-1).long().repeat(N)
+            rgg_child_metadata = self._build_rgg_children_from_indices(source_indices, birth_iter=iter)
+            self.densification_postfix(
+                new_xyz,
+                new_features_dc,
+                new_features_rest,
+                new_opacity,
+                new_scaling,
+                new_rotation,
+                rgg_child_metadata=rgg_child_metadata,
+            )
+        else:
+            self.densification_postfix(
+                new_xyz,
+                new_features_dc,
+                new_features_rest,
+                new_opacity,
+                new_scaling,
+                new_rotation,
+            )
         self._append_visibility_from_masks(selected_pts_mask, repeat_count=N)
 
         prune_filter = torch.cat(
-            (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+            (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device=device, dtype=bool)))
         self.prune_points(prune_filter, iter)
         return split_stats
 
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, iter=None):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -1158,9 +1381,17 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                   new_rotation)
+        if self._rgg_is_enabled():
+            source_indices = selected_pts_mask.nonzero(as_tuple=False).reshape(-1).long()
+            rgg_child_metadata = self._build_rgg_children_from_indices(
+                source_indices,
+                birth_iter=iter if iter is not None else 0,
+            )
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
+                                       new_rotation, rgg_child_metadata=rgg_child_metadata)
+        else:
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
+                                       new_rotation)
         self._append_visibility_from_masks(selected_pts_mask)
         return clone_candidates
 
@@ -1170,7 +1401,7 @@ class GaussianModel:
         grads[grads.isnan()] = 0.0
         growth_diag = GrowthDiagnostics(iteration=iter, num_before=self.get_xyz.shape[0])
 
-        growth_diag.clone_candidates = self.densify_and_clone(grads, max_grad, extent)
+        growth_diag.clone_candidates = self.densify_and_clone(grads, max_grad, extent, iter=iter)
         growth_diag.num_after_clone = self.get_xyz.shape[0]
         (
             growth_diag.split_gradient_candidates,

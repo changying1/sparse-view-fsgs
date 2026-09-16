@@ -37,6 +37,9 @@ def save_paired_fork_checkpoint(path, gaussians, iteration):
         "confidence": gaussians.confidence,
         **capture_rng_state(),
     }
+    rgg_state = _capture_rgg_state(gaussians)
+    if rgg_state is not None:
+        checkpoint["rgg_lineage"] = rgg_state
     torch.save(checkpoint, path)
     print(
         "[PairedForkSave] "
@@ -62,6 +65,7 @@ def load_paired_fork_checkpoint(path, gaussians, training_args):
         restore_optimizer=True,
     )
     gaussians.confidence = _restore_confidence(checkpoint, gaussians)
+    _restore_rgg_state(checkpoint, gaussians)
     restore_rng_state(checkpoint)
     iteration = int(checkpoint["iteration"])
     print(
@@ -109,6 +113,20 @@ def _restore_confidence(checkpoint, gaussians):
             f"({confidence.shape[0]}) does not match Gaussian count ({expected_count})."
         )
     return confidence.to(device=gaussians.get_xyz.device, dtype=confidence.dtype)
+
+
+def _capture_rgg_state(gaussians):
+    capture = getattr(gaussians, "capture_rgg_state", None)
+    if capture is None:
+        return None
+    return capture()
+
+
+def _restore_rgg_state(checkpoint, gaussians):
+    restore = getattr(gaussians, "restore_rgg_state", None)
+    if restore is None:
+        return
+    restore(checkpoint.get("rgg_lineage"))
 
 
 def _torch_load(path):
