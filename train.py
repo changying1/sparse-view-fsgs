@@ -18,11 +18,18 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 import torch
+import random as py_random
 from torchmetrics import PearsonCorrCoef
 from torchmetrics.functional.regression import pearson_corrcoef
 from random import randint
 from utils.loss_utils import l1_loss, l1_loss_mask, l2_loss, ssim
 from utils.depth_utils import estimate_depth
+from utils.observation_evidence import (
+    compute_observation_evidence_diagnostics,
+    format_observation_evidence_diag,
+    format_observation_evidence_edge_diag,
+    format_observation_reliability_diag,
+)
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -40,6 +47,38 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from lpipsPyTorch import lpips
+
+
+def collect_observation_evidence_snapshot(gaussians, train_cameras, pipe, background, render_func=render):
+    py_rng_state = py_random.getstate()
+    np_rng_state = np.random.get_state()
+    torch_rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        rendered_depths = []
+        rendered_rgbs = []
+        mono_depths = []
+        visibility_masks = []
+        valid_masks = []
+        device = gaussians.get_xyz.device
+        with torch.no_grad():
+            for camera in train_cameras:
+                if getattr(camera, "depth_image", None) is None:
+                    raise ValueError("Observation evidence diagnostics require depth_image for every training camera.")
+                render_pkg = render_func(camera, gaussians, pipe, background)
+                rendered_depths.append(render_pkg["depth"][0].detach())
+                rendered_rgbs.append(render_pkg["render"].detach())
+                mono_depths.append(torch.as_tensor(camera.depth_image, device=device).detach())
+                visibility_masks.append(render_pkg["visibility_filter"].detach())
+                mask = getattr(camera, "mask", None)
+                valid_masks.append(torch.as_tensor(mask, device=device).bool().detach() if mask is not None else None)
+        return rendered_depths, mono_depths, visibility_masks, valid_masks, rendered_rgbs
+    finally:
+        py_random.setstate(py_rng_state)
+        np.random.set_state(np_rng_state)
+        torch.set_rng_state(torch_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state)
 
 
 def training(dataset, opt, pipe, args):
@@ -170,6 +209,33 @@ def training(dataset, opt, pipe, args):
 
         loss.backward()
         with torch.no_grad():
+            if (
+                getattr(args, "enable_observation_evidence_diagnostics", False)
+                and opt.densify_from_iter < iteration < opt.densify_until_iter
+                and iteration % opt.densification_interval == 0
+                and all(getattr(camera, "depth_image", None) is not None for camera in train_cameras)
+            ):
+                rendered_depths, mono_depths, visibility_masks, valid_masks, rendered_rgbs = collect_observation_evidence_snapshot(
+                    gaussians,
+                    train_cameras,
+                    pipe,
+                    background,
+                )
+                obs_stats, _, _, _ = compute_observation_evidence_diagnostics(
+                    gaussians.get_xyz.detach(),
+                    gaussians.get_scaling.detach(),
+                    gaussians._rotation.detach(),
+                    train_cameras,
+                    rendered_depths,
+                    mono_depths,
+                    visibility_masks,
+                    valid_masks=valid_masks,
+                    rendered_rgbs=rendered_rgbs,
+                    knn_k=getattr(args, "knn_k", 12),
+                )
+                print(format_observation_evidence_diag(iteration, obs_stats), flush=True)
+                print(format_observation_evidence_edge_diag(iteration, obs_stats), flush=True)
+                print(format_observation_reliability_diag(iteration, obs_stats), flush=True)
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:

@@ -10,7 +10,18 @@ import torch
 from utils.growth_budget import select_proximity_sources
 from utils.value_allocation import compute_structural_value_score
 from utils.value_diagnostics import (
+    compute_balanced_gestalt_diagnostics,
+    compute_defect_gestalt_counterfactual_diagnostics,
+    compute_defect_gestalt_diagnostics,
+    compute_gestalt_value_diagnostics,
     compute_structural_value_attribution_stats,
+    format_balanced_gestalt_diag,
+    format_balanced_gestalt_promotion_diag,
+    format_defect_gestalt_counterfactual_diag,
+    format_defect_gestalt_diag,
+    format_defect_gestalt_promotion_diag,
+    format_gestalt_promotion_diag,
+    format_gestalt_value_diag,
     format_structural_boundary_diag,
     format_structural_norm_diag,
     format_structural_promotion_attr,
@@ -345,6 +356,321 @@ def test_structural_log_fields_are_complete():
         "a1_overlap=",
     ):
         assert field in promotion_log
+
+
+def test_gestalt_diag_log_fields_are_complete():
+    components = _components()
+    components["G"] = torch.tensor([0.0, 0.2, 0.9, 0.1])
+    components["U_base"] = components["U"].clone()
+    components["U"] = components["U_base"] * (1.0 + components["G"])
+    components["gestalt_lambda"] = 1.0
+    stats = compute_gestalt_value_diagnostics(
+        10,
+        components,
+        torch.ones(4, dtype=torch.bool),
+        _budget_stats_with_pairs(),
+    )
+    value_log = format_gestalt_value_diag(stats)
+    promotion_log = format_gestalt_promotion_diag(stats)
+
+    for field in (
+        "[GestaltValueDiag]",
+        "iter=10",
+        "candidates=4",
+        "lambda_g=1.000000",
+        "G_mean=",
+        "G_min=",
+        "G_max=",
+        "G_q25=",
+        "G_q50=",
+        "G_q75=",
+        "base_U_mean=",
+        "gestalt_U_mean=",
+    ):
+        assert field in value_log
+    for field in (
+        "[GestaltPromotionDiag]",
+        "promotions=1",
+        "mean_G_promoted=",
+        "mean_G_displaced=",
+        "mean_delta_G=",
+        "G_win_ratio=",
+        "mean_base_U_promoted=",
+        "mean_base_U_displaced=",
+        "mean_gestalt_U_promoted=",
+        "mean_gestalt_U_displaced=",
+    ):
+        assert field in promotion_log
+    assert stats["mean_delta_G"] == pytest.approx(0.7)
+    assert stats["G_win_ratio"] == pytest.approx(1.0)
+
+
+def test_balanced_gestalt_diag_log_fields_are_complete():
+    components = _components()
+    components["S_need"] = torch.tensor([0.0, 1.0, 0.6, 0.2])
+    components["G"] = torch.tensor([0.0, 0.2, 0.9, 0.1])
+    components["U"] = 0.5 * components["S_need"] + 0.5 * components["G"]
+    components["gestalt_balance_alpha"] = 0.5
+    stats = compute_balanced_gestalt_diagnostics(
+        10,
+        components,
+        torch.ones(4, dtype=torch.bool),
+        _budget_stats_with_pairs(),
+    )
+    value_log = format_balanced_gestalt_diag(stats)
+    promotion_log = format_balanced_gestalt_promotion_diag(stats)
+
+    for field in (
+        "[BalancedGestaltDiag]",
+        "iter=10",
+        "candidates=4",
+        "alpha=0.500000",
+        "S_need_mean=",
+        "S_need_q25=",
+        "S_need_q50=",
+        "S_need_q75=",
+        "G_mean=",
+        "G_q25=",
+        "G_q50=",
+        "G_q75=",
+        "U_balanced_mean=",
+    ):
+        assert field in value_log
+    for field in (
+        "[BalancedGestaltPromotionDiag]",
+        "promotions=1",
+        "mean_S_need_promoted=",
+        "mean_S_need_displaced=",
+        "mean_delta_S_need=",
+        "S_need_win_ratio=",
+        "mean_G_promoted=",
+        "mean_G_displaced=",
+        "mean_delta_G=",
+        "G_win_ratio=",
+        "mean_U_promoted=",
+        "mean_U_displaced=",
+    ):
+        assert field in promotion_log
+    assert stats["mean_delta_S_need"] == pytest.approx(-0.4)
+    assert stats["mean_delta_G"] == pytest.approx(0.7)
+    assert stats["G_win_ratio"] == pytest.approx(1.0)
+
+
+def test_defect_gestalt_diag_log_fields_and_dg_values_are_complete():
+    components = _components()
+    components["K"] = torch.tensor([0.0, 0.3, 0.4, 0.1])
+    components["D"] = torch.tensor([0.0, 0.4, 0.8, 0.2])
+    components["G"] = torch.tensor([0.0, 0.2, 0.9, 0.1])
+    components["DG"] = components["D"] * components["G"]
+    components["U_base"] = components["K"] + components["D"]
+    components["U"] = components["U_base"] + components["DG"]
+    components["gestalt_lambda"] = 1.0
+    stats = compute_defect_gestalt_diagnostics(
+        10,
+        components,
+        torch.ones(4, dtype=torch.bool),
+        _budget_stats_with_pairs(),
+    )
+    value_log = format_defect_gestalt_diag(stats)
+    promotion_log = format_defect_gestalt_promotion_diag(stats)
+
+    for field in (
+        "[DefectGestaltDiag]",
+        "iter=10",
+        "candidates=4",
+        "lambda_g=1.000000",
+        "K_mean=",
+        "D_mean=",
+        "G_mean=",
+        "DG_mean=",
+        "D_q25=",
+        "D_q50=",
+        "D_q75=",
+        "G_q25=",
+        "G_q50=",
+        "G_q75=",
+        "DG_q25=",
+        "DG_q50=",
+        "DG_q75=",
+        "base_U_mean=",
+        "conditioned_U_mean=",
+    ):
+        assert field in value_log
+    for field in (
+        "[DefectGestaltPromotionDiag]",
+        "promotions=1",
+        "mean_K_promoted=",
+        "mean_delta_K=",
+        "K_win_ratio=",
+        "mean_D_promoted=",
+        "mean_delta_D=",
+        "D_win_ratio=",
+        "mean_G_promoted=",
+        "mean_delta_G=",
+        "G_win_ratio=",
+        "mean_DG_promoted=",
+        "mean_DG_displaced=",
+        "mean_delta_DG=",
+        "DG_win_ratio=",
+        "mean_base_U_promoted=",
+        "mean_base_U_displaced=",
+        "mean_conditioned_U_promoted=",
+        "mean_conditioned_U_displaced=",
+    ):
+        assert field in promotion_log
+    assert stats["mean_DG_promoted"] == pytest.approx(0.72)
+    assert stats["mean_DG_displaced"] == pytest.approx(0.08)
+    assert stats["mean_delta_DG"] == pytest.approx(0.64)
+    assert stats["DG_win_ratio"] == pytest.approx(1.0)
+
+
+def test_defect_gestalt_counterfactual_reports_kd_vs_conditioned_swap():
+    components = {
+        "K": torch.tensor([0.0, 0.2, 0.1, 0.0]),
+        "D": torch.tensor([0.0, 0.6, 0.6, 0.0]),
+        "G": torch.tensor([0.0, 0.0, 1.0, 0.0]),
+        "DG": torch.tensor([0.0, 0.0, 0.6, 0.0]),
+        "U_base": torch.tensor([0.0, 0.8, 0.7, 0.0]),
+        "U": torch.tensor([0.0, 0.8, 1.3, 0.0]),
+        "gestalt_lambda": 1.0,
+    }
+    candidate_mask = torch.ones(4, dtype=torch.bool)
+    dist = torch.tensor([200.0, 100.0, 95.0, 90.0])
+    actual_mask, actual_stats = select_proximity_sources(
+        candidate_mask,
+        dist,
+        n=1,
+        rho=0.5,
+        enabled=True,
+        mode="value_demand_rerank",
+        value_score=components["U"],
+        rerank_fraction=0.5,
+        boundary_multiplier=2.0,
+        demand_ratio=0.90,
+    )
+    kd_mask, kd_stats = select_proximity_sources(
+        candidate_mask,
+        dist,
+        n=1,
+        rho=0.5,
+        enabled=True,
+        mode="value_demand_rerank",
+        value_score=components["U_base"],
+        rerank_fraction=0.5,
+        boundary_multiplier=2.0,
+        demand_ratio=0.90,
+    )
+
+    stats = compute_defect_gestalt_counterfactual_diagnostics(
+        10,
+        components,
+        candidate_mask,
+        actual_mask,
+        actual_stats,
+        kd_mask,
+        kd_stats,
+        dist,
+    )
+    log_line = format_defect_gestalt_counterfactual_diag(stats)
+
+    assert actual_stats.selected_indices == (0, 2)
+    assert kd_stats.selected_indices == (0, 1)
+    assert stats["overlap_count"] == 1
+    assert stats["overlap_ratio"] == pytest.approx(0.5)
+    assert stats["swap_in"] == 1
+    assert stats["swap_out"] == 1
+    assert stats["swap_ratio"] == pytest.approx(0.5)
+    assert stats["count_match"] is True
+    assert stats["mean_DG_swap_in"] == pytest.approx(0.6)
+    assert stats["mean_DG_swap_out"] == pytest.approx(0.0)
+    assert stats["mean_delta_DG"] == pytest.approx(0.6)
+    assert stats["mean_base_U_swap_in"] == pytest.approx(0.7)
+    assert stats["mean_base_U_swap_out"] == pytest.approx(0.8)
+    assert stats["mean_delta_base_U"] == pytest.approx(-0.1)
+    assert stats["mean_conditioned_U_swap_in"] == pytest.approx(1.3)
+    assert stats["mean_conditioned_U_swap_out"] == pytest.approx(0.8)
+    assert stats["mean_delta_conditioned_U"] == pytest.approx(0.5)
+    for field in (
+        "[DefectGestaltCounterfactual]",
+        "kd_selected=2",
+        "conditioned_selected=2",
+        "overlap_count=1",
+        "overlap_ratio=",
+        "swap_in=1",
+        "swap_out=1",
+        "swap_ratio=",
+        "count_match=True",
+        "mean_DG_swap_in=",
+        "mean_DG_swap_out=",
+        "mean_delta_DG=",
+        "mean_base_U_swap_in=",
+        "mean_base_U_swap_out=",
+        "mean_delta_base_U=",
+        "mean_conditioned_U_swap_in=",
+        "mean_conditioned_U_swap_out=",
+        "mean_delta_conditioned_U=",
+        "mean_P_swap_in=",
+        "mean_P_swap_out=",
+        "mean_delta_P=",
+    ):
+        assert field in log_line
+
+
+def test_defect_gestalt_counterfactual_identical_selection_has_empty_swaps():
+    components = {
+        "K": torch.tensor([0.0, 0.2, 0.1, 0.0]),
+        "D": torch.tensor([0.0, 0.6, 0.6, 0.0]),
+        "G": torch.tensor([0.0, 0.0, 1.0, 0.0]),
+        "DG": torch.tensor([0.0, 0.0, 0.6, 0.0]),
+        "U_base": torch.tensor([0.0, 0.8, 0.7, 0.0]),
+        "U": torch.tensor([0.0, 0.8, 0.7, 0.0]),
+        "gestalt_lambda": 0.0,
+    }
+    candidate_mask = torch.ones(4, dtype=torch.bool)
+    dist = torch.tensor([200.0, 100.0, 95.0, 90.0])
+    actual_mask, actual_stats = select_proximity_sources(
+        candidate_mask,
+        dist,
+        n=1,
+        rho=0.5,
+        enabled=True,
+        mode="value_demand_rerank",
+        value_score=components["U"],
+        rerank_fraction=0.5,
+        boundary_multiplier=2.0,
+        demand_ratio=0.90,
+    )
+    kd_mask, kd_stats = select_proximity_sources(
+        candidate_mask,
+        dist,
+        n=1,
+        rho=0.5,
+        enabled=True,
+        mode="value_demand_rerank",
+        value_score=components["U_base"],
+        rerank_fraction=0.5,
+        boundary_multiplier=2.0,
+        demand_ratio=0.90,
+    )
+
+    stats = compute_defect_gestalt_counterfactual_diagnostics(
+        10,
+        components,
+        candidate_mask,
+        actual_mask,
+        actual_stats,
+        kd_mask,
+        kd_stats,
+        dist,
+    )
+
+    assert stats["overlap_ratio"] == pytest.approx(1.0)
+    assert stats["swap_in"] == 0
+    assert stats["swap_out"] == 0
+    assert stats["swap_ratio"] == pytest.approx(0.0)
+    assert math.isnan(stats["mean_DG_swap_in"])
+    assert math.isnan(stats["mean_DG_swap_out"])
+    assert math.isnan(stats["mean_delta_DG"])
 
 
 def _load_gaussian_model_module(monkeypatch):

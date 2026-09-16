@@ -253,6 +253,454 @@ def format_structural_promotion_attr(stats):
     return " ".join(parts)
 
 
+@torch.no_grad()
+def compute_gestalt_value_diagnostics(iteration, components, candidate_mask, budget_stats):
+    required = ("G", "U_base", "U")
+    for name in required:
+        if name not in components:
+            raise ValueError(f"components missing '{name}'.")
+    utility = components["U"]
+    if not torch.is_tensor(utility) or utility.ndim != 1:
+        raise ValueError("U must be a Tensor[N].")
+    n = utility.shape[0]
+    device = utility.device
+    if not torch.is_tensor(candidate_mask) or candidate_mask.shape != (n,):
+        raise ValueError("candidate_mask must be a BoolTensor[N].")
+    candidate = candidate_mask.to(device=device, dtype=torch.bool)
+    g = components["G"].to(device=device, dtype=torch.float32)
+    base_u = components["U_base"].to(device=device, dtype=torch.float32)
+    gestalt_u = utility.to(device=device, dtype=torch.float32)
+    promoted = _indices_tensor(getattr(budget_stats, "demand_promoted_indices", ()), device)
+    displaced = _indices_tensor(getattr(budget_stats, "demand_displaced_indices", ()), device)
+    if promoted.numel() != displaced.numel():
+        raise ValueError("promoted and displaced indices must be paired.")
+
+    stats = {
+        "iteration": iteration,
+        "candidates": int(candidate.sum().item()),
+        "lambda_g": float(components.get("gestalt_lambda", 1.0)),
+        "promotions": int(getattr(budget_stats, "promotion_accepted", promoted.numel())),
+        "G_mean": _masked_mean(g, candidate),
+        "G_min": _masked_min(g, candidate),
+        "G_max": _masked_max(g, candidate),
+        "base_U_mean": _masked_mean(base_u, candidate),
+        "gestalt_U_mean": _masked_mean(gestalt_u, candidate),
+    }
+    stats.update(_masked_quantile_stats("G", g, candidate, (0.25, 0.50, 0.75)))
+    if promoted.numel() == 0:
+        stats.update({
+            "mean_G_promoted": float("nan"),
+            "mean_G_displaced": float("nan"),
+            "mean_delta_G": float("nan"),
+            "G_win_ratio": float("nan"),
+            "mean_base_U_promoted": float("nan"),
+            "mean_base_U_displaced": float("nan"),
+            "mean_gestalt_U_promoted": float("nan"),
+            "mean_gestalt_U_displaced": float("nan"),
+        })
+        return stats
+
+    promoted_g = g[promoted]
+    displaced_g = g[displaced]
+    finite_pairs = torch.isfinite(promoted_g) & torch.isfinite(displaced_g)
+    stats.update({
+        "mean_G_promoted": _indexed_mean(g, promoted),
+        "mean_G_displaced": _indexed_mean(g, displaced),
+        "mean_delta_G": _finite_tensor_mean(promoted_g - displaced_g),
+        "G_win_ratio": (
+            float((promoted_g[finite_pairs] > displaced_g[finite_pairs]).to(dtype=torch.float32).mean().item())
+            if finite_pairs.any()
+            else float("nan")
+        ),
+        "mean_base_U_promoted": _indexed_mean(base_u, promoted),
+        "mean_base_U_displaced": _indexed_mean(base_u, displaced),
+        "mean_gestalt_U_promoted": _indexed_mean(gestalt_u, promoted),
+        "mean_gestalt_U_displaced": _indexed_mean(gestalt_u, displaced),
+    })
+    return stats
+
+
+def format_gestalt_value_diag(stats):
+    return (
+        f"[GestaltValueDiag] iter={stats['iteration']} "
+        f"candidates={stats['candidates']} "
+        f"lambda_g={stats['lambda_g']:.6f} "
+        f"G_mean={stats['G_mean']:.6f} "
+        f"G_min={stats['G_min']:.6f} "
+        f"G_max={stats['G_max']:.6f} "
+        f"G_q25={stats['G_q25']:.6f} "
+        f"G_q50={stats['G_q50']:.6f} "
+        f"G_q75={stats['G_q75']:.6f} "
+        f"base_U_mean={stats['base_U_mean']:.6f} "
+        f"gestalt_U_mean={stats['gestalt_U_mean']:.6f}"
+    )
+
+
+def format_gestalt_promotion_diag(stats):
+    return (
+        f"[GestaltPromotionDiag] iter={stats['iteration']} "
+        f"promotions={stats['promotions']} "
+        f"mean_G_promoted={stats['mean_G_promoted']:.6f} "
+        f"mean_G_displaced={stats['mean_G_displaced']:.6f} "
+        f"mean_delta_G={stats['mean_delta_G']:.6f} "
+        f"G_win_ratio={stats['G_win_ratio']:.6f} "
+        f"mean_base_U_promoted={stats['mean_base_U_promoted']:.6f} "
+        f"mean_base_U_displaced={stats['mean_base_U_displaced']:.6f} "
+        f"mean_gestalt_U_promoted={stats['mean_gestalt_U_promoted']:.6f} "
+        f"mean_gestalt_U_displaced={stats['mean_gestalt_U_displaced']:.6f}"
+    )
+
+
+@torch.no_grad()
+def compute_balanced_gestalt_diagnostics(iteration, components, candidate_mask, budget_stats):
+    required = ("S_need", "G", "U")
+    for name in required:
+        if name not in components:
+            raise ValueError(f"components missing '{name}'.")
+    utility = components["U"]
+    if not torch.is_tensor(utility) or utility.ndim != 1:
+        raise ValueError("U must be a Tensor[N].")
+    n = utility.shape[0]
+    device = utility.device
+    if not torch.is_tensor(candidate_mask) or candidate_mask.shape != (n,):
+        raise ValueError("candidate_mask must be a BoolTensor[N].")
+    candidate = candidate_mask.to(device=device, dtype=torch.bool)
+    s_need = components["S_need"].to(device=device, dtype=torch.float32)
+    g = components["G"].to(device=device, dtype=torch.float32)
+    promoted = _indices_tensor(getattr(budget_stats, "demand_promoted_indices", ()), device)
+    displaced = _indices_tensor(getattr(budget_stats, "demand_displaced_indices", ()), device)
+    if promoted.numel() != displaced.numel():
+        raise ValueError("promoted and displaced indices must be paired.")
+
+    stats = {
+        "iteration": iteration,
+        "candidates": int(candidate.sum().item()),
+        "alpha": float(components.get("gestalt_balance_alpha", 0.5)),
+        "promotions": int(getattr(budget_stats, "promotion_accepted", promoted.numel())),
+        "S_need_mean": _masked_mean(s_need, candidate),
+        "G_mean": _masked_mean(g, candidate),
+        "U_balanced_mean": _masked_mean(utility.to(device=device, dtype=torch.float32), candidate),
+    }
+    stats.update(_masked_quantile_stats("S_need", s_need, candidate, (0.25, 0.50, 0.75)))
+    stats.update(_masked_quantile_stats("G", g, candidate, (0.25, 0.50, 0.75)))
+
+    if promoted.numel() == 0:
+        stats.update({
+            "mean_S_need_promoted": float("nan"),
+            "mean_S_need_displaced": float("nan"),
+            "mean_delta_S_need": float("nan"),
+            "S_need_win_ratio": float("nan"),
+            "mean_G_promoted": float("nan"),
+            "mean_G_displaced": float("nan"),
+            "mean_delta_G": float("nan"),
+            "G_win_ratio": float("nan"),
+            "mean_U_promoted": float("nan"),
+            "mean_U_displaced": float("nan"),
+        })
+        return stats
+
+    promoted_s = s_need[promoted]
+    displaced_s = s_need[displaced]
+    promoted_g = g[promoted]
+    displaced_g = g[displaced]
+    finite_s_pairs = torch.isfinite(promoted_s) & torch.isfinite(displaced_s)
+    finite_g_pairs = torch.isfinite(promoted_g) & torch.isfinite(displaced_g)
+    stats.update({
+        "mean_S_need_promoted": _indexed_mean(s_need, promoted),
+        "mean_S_need_displaced": _indexed_mean(s_need, displaced),
+        "mean_delta_S_need": _finite_tensor_mean(promoted_s - displaced_s),
+        "S_need_win_ratio": (
+            float((promoted_s[finite_s_pairs] > displaced_s[finite_s_pairs]).to(dtype=torch.float32).mean().item())
+            if finite_s_pairs.any()
+            else float("nan")
+        ),
+        "mean_G_promoted": _indexed_mean(g, promoted),
+        "mean_G_displaced": _indexed_mean(g, displaced),
+        "mean_delta_G": _finite_tensor_mean(promoted_g - displaced_g),
+        "G_win_ratio": (
+            float((promoted_g[finite_g_pairs] > displaced_g[finite_g_pairs]).to(dtype=torch.float32).mean().item())
+            if finite_g_pairs.any()
+            else float("nan")
+        ),
+        "mean_U_promoted": _indexed_mean(utility, promoted),
+        "mean_U_displaced": _indexed_mean(utility, displaced),
+    })
+    return stats
+
+
+def format_balanced_gestalt_diag(stats):
+    return (
+        f"[BalancedGestaltDiag] iter={stats['iteration']} "
+        f"candidates={stats['candidates']} "
+        f"alpha={stats['alpha']:.6f} "
+        f"S_need_mean={stats['S_need_mean']:.6f} "
+        f"S_need_q25={stats['S_need_q25']:.6f} "
+        f"S_need_q50={stats['S_need_q50']:.6f} "
+        f"S_need_q75={stats['S_need_q75']:.6f} "
+        f"G_mean={stats['G_mean']:.6f} "
+        f"G_q25={stats['G_q25']:.6f} "
+        f"G_q50={stats['G_q50']:.6f} "
+        f"G_q75={stats['G_q75']:.6f} "
+        f"U_balanced_mean={stats['U_balanced_mean']:.6f}"
+    )
+
+
+def format_balanced_gestalt_promotion_diag(stats):
+    return (
+        f"[BalancedGestaltPromotionDiag] iter={stats['iteration']} "
+        f"promotions={stats['promotions']} "
+        f"mean_S_need_promoted={stats['mean_S_need_promoted']:.6f} "
+        f"mean_S_need_displaced={stats['mean_S_need_displaced']:.6f} "
+        f"mean_delta_S_need={stats['mean_delta_S_need']:.6f} "
+        f"S_need_win_ratio={stats['S_need_win_ratio']:.6f} "
+        f"mean_G_promoted={stats['mean_G_promoted']:.6f} "
+        f"mean_G_displaced={stats['mean_G_displaced']:.6f} "
+        f"mean_delta_G={stats['mean_delta_G']:.6f} "
+        f"G_win_ratio={stats['G_win_ratio']:.6f} "
+        f"mean_U_promoted={stats['mean_U_promoted']:.6f} "
+        f"mean_U_displaced={stats['mean_U_displaced']:.6f}"
+    )
+
+
+@torch.no_grad()
+def compute_defect_gestalt_diagnostics(iteration, components, candidate_mask, budget_stats):
+    required = ("K", "D", "G", "DG", "U_base", "U")
+    for name in required:
+        if name not in components:
+            raise ValueError(f"components missing '{name}'.")
+    utility = components["U"]
+    if not torch.is_tensor(utility) or utility.ndim != 1:
+        raise ValueError("U must be a Tensor[N].")
+    n = utility.shape[0]
+    device = utility.device
+    if not torch.is_tensor(candidate_mask) or candidate_mask.shape != (n,):
+        raise ValueError("candidate_mask must be a BoolTensor[N].")
+    candidate = candidate_mask.to(device=device, dtype=torch.bool)
+    values = {
+        "K": components["K"].to(device=device, dtype=torch.float32),
+        "D": components["D"].to(device=device, dtype=torch.float32),
+        "G": components["G"].to(device=device, dtype=torch.float32),
+        "DG": components["DG"].to(device=device, dtype=torch.float32),
+        "base_U": components["U_base"].to(device=device, dtype=torch.float32),
+        "conditioned_U": utility.to(device=device, dtype=torch.float32),
+    }
+    promoted = _indices_tensor(getattr(budget_stats, "demand_promoted_indices", ()), device)
+    displaced = _indices_tensor(getattr(budget_stats, "demand_displaced_indices", ()), device)
+    if promoted.numel() != displaced.numel():
+        raise ValueError("promoted and displaced indices must be paired.")
+
+    stats = {
+        "iteration": iteration,
+        "candidates": int(candidate.sum().item()),
+        "lambda_g": float(components.get("gestalt_lambda", 1.0)),
+        "promotions": int(getattr(budget_stats, "promotion_accepted", promoted.numel())),
+        "K_mean": _masked_mean(values["K"], candidate),
+        "D_mean": _masked_mean(values["D"], candidate),
+        "G_mean": _masked_mean(values["G"], candidate),
+        "DG_mean": _masked_mean(values["DG"], candidate),
+        "base_U_mean": _masked_mean(values["base_U"], candidate),
+        "conditioned_U_mean": _masked_mean(values["conditioned_U"], candidate),
+    }
+    for name in ("D", "G", "DG"):
+        stats.update(_masked_quantile_stats(name, values[name], candidate, (0.25, 0.50, 0.75)))
+
+    for name in ("K", "D", "G", "DG"):
+        tensor = values[name]
+        if promoted.numel() == 0:
+            stats[f"mean_{name}_promoted"] = float("nan")
+            stats[f"mean_{name}_displaced"] = float("nan")
+            stats[f"mean_delta_{name}"] = float("nan")
+            stats[f"{name}_win_ratio"] = float("nan")
+            continue
+        promoted_values = tensor[promoted]
+        displaced_values = tensor[displaced]
+        finite_pairs = torch.isfinite(promoted_values) & torch.isfinite(displaced_values)
+        stats[f"mean_{name}_promoted"] = _indexed_mean(tensor, promoted)
+        stats[f"mean_{name}_displaced"] = _indexed_mean(tensor, displaced)
+        stats[f"mean_delta_{name}"] = _finite_tensor_mean(promoted_values - displaced_values)
+        stats[f"{name}_win_ratio"] = (
+            float((promoted_values[finite_pairs] > displaced_values[finite_pairs]).to(dtype=torch.float32).mean().item())
+            if finite_pairs.any()
+            else float("nan")
+        )
+
+    if promoted.numel() == 0:
+        stats["mean_base_U_promoted"] = float("nan")
+        stats["mean_base_U_displaced"] = float("nan")
+        stats["mean_conditioned_U_promoted"] = float("nan")
+        stats["mean_conditioned_U_displaced"] = float("nan")
+    else:
+        stats["mean_base_U_promoted"] = _indexed_mean(values["base_U"], promoted)
+        stats["mean_base_U_displaced"] = _indexed_mean(values["base_U"], displaced)
+        stats["mean_conditioned_U_promoted"] = _indexed_mean(values["conditioned_U"], promoted)
+        stats["mean_conditioned_U_displaced"] = _indexed_mean(values["conditioned_U"], displaced)
+    return stats
+
+
+def format_defect_gestalt_diag(stats):
+    return (
+        f"[DefectGestaltDiag] iter={stats['iteration']} "
+        f"candidates={stats['candidates']} "
+        f"lambda_g={stats['lambda_g']:.6f} "
+        f"K_mean={stats['K_mean']:.6f} "
+        f"D_mean={stats['D_mean']:.6f} "
+        f"G_mean={stats['G_mean']:.6f} "
+        f"DG_mean={stats['DG_mean']:.6f} "
+        f"D_q25={stats['D_q25']:.6f} "
+        f"D_q50={stats['D_q50']:.6f} "
+        f"D_q75={stats['D_q75']:.6f} "
+        f"G_q25={stats['G_q25']:.6f} "
+        f"G_q50={stats['G_q50']:.6f} "
+        f"G_q75={stats['G_q75']:.6f} "
+        f"DG_q25={stats['DG_q25']:.6f} "
+        f"DG_q50={stats['DG_q50']:.6f} "
+        f"DG_q75={stats['DG_q75']:.6f} "
+        f"base_U_mean={stats['base_U_mean']:.6f} "
+        f"conditioned_U_mean={stats['conditioned_U_mean']:.6f}"
+    )
+
+
+def format_defect_gestalt_promotion_diag(stats):
+    parts = [
+        "[DefectGestaltPromotionDiag]",
+        f"iter={stats['iteration']}",
+        f"promotions={stats['promotions']}",
+    ]
+    for name in ("K", "D", "G", "DG"):
+        parts.extend(
+            [
+                f"mean_{name}_promoted={stats[f'mean_{name}_promoted']:.6f}",
+                f"mean_{name}_displaced={stats[f'mean_{name}_displaced']:.6f}",
+                f"mean_delta_{name}={stats[f'mean_delta_{name}']:.6f}",
+                f"{name}_win_ratio={stats[f'{name}_win_ratio']:.6f}",
+            ]
+        )
+    parts.extend(
+        [
+            f"mean_base_U_promoted={stats['mean_base_U_promoted']:.6f}",
+            f"mean_base_U_displaced={stats['mean_base_U_displaced']:.6f}",
+            f"mean_conditioned_U_promoted={stats['mean_conditioned_U_promoted']:.6f}",
+            f"mean_conditioned_U_displaced={stats['mean_conditioned_U_displaced']:.6f}",
+        ]
+    )
+    return " ".join(parts)
+
+
+@torch.no_grad()
+def compute_defect_gestalt_counterfactual_diagnostics(
+    iteration,
+    components,
+    candidate_mask,
+    actual_selected_mask,
+    actual_budget_stats,
+    kd_selected_mask,
+    kd_budget_stats,
+    proximity_values,
+):
+    required = ("K", "D", "G", "DG", "U_base", "U", "gestalt_lambda")
+    for name in required:
+        if name not in components:
+            raise ValueError(f"components missing '{name}'.")
+    utility = components["U"]
+    if not torch.is_tensor(utility) or utility.ndim != 1:
+        raise ValueError("U must be a Tensor[N].")
+    n = utility.shape[0]
+    device = utility.device
+    masks = {
+        "candidate_mask": candidate_mask,
+        "actual_selected_mask": actual_selected_mask,
+        "kd_selected_mask": kd_selected_mask,
+    }
+    for name, mask in masks.items():
+        if not torch.is_tensor(mask) or mask.shape != (n,):
+            raise ValueError(f"{name} must be a BoolTensor[N].")
+    if not torch.is_tensor(proximity_values) or proximity_values.shape != (n,):
+        raise ValueError("proximity_values must be a Tensor[N].")
+
+    candidate = candidate_mask.to(device=device, dtype=torch.bool)
+    actual = actual_selected_mask.to(device=device, dtype=torch.bool)
+    kd = kd_selected_mask.to(device=device, dtype=torch.bool)
+    overlap = actual & kd
+    swap_in_mask = actual & ~kd
+    swap_out_mask = kd & ~actual
+    swap_in_indices = torch.nonzero(swap_in_mask, as_tuple=False).reshape(-1)
+    swap_out_indices = torch.nonzero(swap_out_mask, as_tuple=False).reshape(-1)
+    conditioned_selected = int(actual.sum().item())
+    kd_selected = int(kd.sum().item())
+    overlap_count = int(overlap.sum().item())
+    swap_in = int(swap_in_mask.sum().item())
+    swap_out = int(swap_out_mask.sum().item())
+
+    values = {
+        "K": components["K"].to(device=device, dtype=torch.float32),
+        "D": components["D"].to(device=device, dtype=torch.float32),
+        "G": components["G"].to(device=device, dtype=torch.float32),
+        "DG": components["DG"].to(device=device, dtype=torch.float32),
+        "base_U": components["U_base"].to(device=device, dtype=torch.float32),
+        "conditioned_U": utility.to(device=device, dtype=torch.float32),
+        "P": proximity_values.to(device=device, dtype=torch.float32),
+    }
+    stats = {
+        "iteration": iteration,
+        "lambda_g": float(components["gestalt_lambda"]),
+        "candidates": int(candidate.sum().item()),
+        "kd_selected": kd_selected,
+        "conditioned_selected": conditioned_selected,
+        "overlap_count": overlap_count,
+        "overlap_ratio": _safe_ratio(overlap_count, conditioned_selected),
+        "swap_in": swap_in,
+        "swap_out": swap_out,
+        "swap_ratio": _safe_ratio(swap_in, conditioned_selected),
+        "count_match": swap_in == swap_out,
+        "actual_mode": getattr(actual_budget_stats, "mode", ""),
+        "kd_mode": getattr(kd_budget_stats, "mode", ""),
+    }
+    for name, tensor in values.items():
+        mean_in = _indexed_mean(tensor, swap_in_indices)
+        mean_out = _indexed_mean(tensor, swap_out_indices)
+        stats[f"mean_{name}_swap_in"] = mean_in
+        stats[f"mean_{name}_swap_out"] = mean_out
+        stats[f"mean_delta_{name}"] = mean_in - mean_out
+    return stats
+
+
+def format_defect_gestalt_counterfactual_diag(stats):
+    return (
+        f"[DefectGestaltCounterfactual] iter={stats['iteration']} "
+        f"lambda_g={stats['lambda_g']:.6f} "
+        f"candidates={stats['candidates']} "
+        f"kd_selected={stats['kd_selected']} "
+        f"conditioned_selected={stats['conditioned_selected']} "
+        f"overlap_count={stats['overlap_count']} "
+        f"overlap_ratio={stats['overlap_ratio']:.6f} "
+        f"swap_in={stats['swap_in']} "
+        f"swap_out={stats['swap_out']} "
+        f"swap_ratio={stats['swap_ratio']:.6f} "
+        f"count_match={stats['count_match']} "
+        f"mean_K_swap_in={stats['mean_K_swap_in']:.6f} "
+        f"mean_K_swap_out={stats['mean_K_swap_out']:.6f} "
+        f"mean_delta_K={stats['mean_delta_K']:.6f} "
+        f"mean_D_swap_in={stats['mean_D_swap_in']:.6f} "
+        f"mean_D_swap_out={stats['mean_D_swap_out']:.6f} "
+        f"mean_delta_D={stats['mean_delta_D']:.6f} "
+        f"mean_G_swap_in={stats['mean_G_swap_in']:.6f} "
+        f"mean_G_swap_out={stats['mean_G_swap_out']:.6f} "
+        f"mean_delta_G={stats['mean_delta_G']:.6f} "
+        f"mean_DG_swap_in={stats['mean_DG_swap_in']:.6f} "
+        f"mean_DG_swap_out={stats['mean_DG_swap_out']:.6f} "
+        f"mean_delta_DG={stats['mean_delta_DG']:.6f} "
+        f"mean_base_U_swap_in={stats['mean_base_U_swap_in']:.6f} "
+        f"mean_base_U_swap_out={stats['mean_base_U_swap_out']:.6f} "
+        f"mean_delta_base_U={stats['mean_delta_base_U']:.6f} "
+        f"mean_conditioned_U_swap_in={stats['mean_conditioned_U_swap_in']:.6f} "
+        f"mean_conditioned_U_swap_out={stats['mean_conditioned_U_swap_out']:.6f} "
+        f"mean_delta_conditioned_U={stats['mean_delta_conditioned_U']:.6f} "
+        f"mean_P_swap_in={stats['mean_P_swap_in']:.6f} "
+        f"mean_P_swap_out={stats['mean_P_swap_out']:.6f} "
+        f"mean_delta_P={stats['mean_delta_P']:.6f}"
+    )
+
+
 def _basic_stats(name, values):
     return {
         f"{name}_mean": _masked_mean(values),
@@ -263,6 +711,13 @@ def _basic_stats(name, values):
 
 def _quantile_stats(name, values, quantiles):
     finite = values[torch.isfinite(values)]
+    if finite.numel() == 0:
+        return {f"{name}_q{int(q * 100):02d}": 0.0 for q in quantiles}
+    return {f"{name}_q{int(q * 100):02d}": float(torch.quantile(finite, q).item()) for q in quantiles}
+
+
+def _masked_quantile_stats(name, values, mask, quantiles):
+    finite = _masked_values(values, mask)
     if finite.numel() == 0:
         return {f"{name}_q{int(q * 100):02d}": 0.0 for q in quantiles}
     return {f"{name}_q{int(q * 100):02d}": float(torch.quantile(finite, q).item()) for q in quantiles}
@@ -291,6 +746,10 @@ def _masked_max(values, mask=None):
 
 def _ratio(count, total):
     return float(count) / float(max(int(total), 1))
+
+
+def _safe_ratio(count, total):
+    return float(count) / float(total) if int(total) > 0 else 0.0
 
 
 def _component_tensor(components, name):

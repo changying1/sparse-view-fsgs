@@ -1,3 +1,6 @@
+import sys
+from argparse import ArgumentParser
+
 import pytest
 import torch
 
@@ -9,6 +12,7 @@ from utils.growth_budget import (
     format_proximity_budget_log,
     format_proximity_capacity_log,
     format_proximity_replay_log,
+    format_value_timing_log,
     format_value_promotion_diag,
     format_value_rerank_diag,
     parse_proximity_action_replay,
@@ -17,7 +21,7 @@ from utils.growth_budget import (
     robust_normalize,
     select_proximity_sources,
 )
-from arguments import validate_optimization_params
+from arguments import OptimizationParams, validate_optimization_params
 
 
 def test_budget_new_is_floor_rho_times_current():
@@ -1068,9 +1072,63 @@ def test_value_score_variant_validation_defaults_to_obdkr():
     assert validate_optimization_params(args) is args
     args.value_score_variant = "structural"
     assert validate_optimization_params(args) is args
+    args.value_score_variant = "gestalt_structural"
+    assert validate_optimization_params(args) is args
+    args.value_score_variant = "gestalt_balanced"
+    assert validate_optimization_params(args) is args
+    args.value_score_variant = "gestalt_defect_conditioned"
+    assert validate_optimization_params(args) is args
     args.value_score_variant = "bad"
     with pytest.raises(ValueError, match="value_score_variant"):
         validate_optimization_params(args)
+
+
+def test_gestalt_value_lambda_validation():
+    args = type("Args", (), {
+        "proximity_selection_mode": "value_demand_rerank",
+        "proximity_growth_ratio": 0.1,
+        "value_rerank_fraction": 0.25,
+        "value_boundary_multiplier": 2.0,
+        "value_demand_ratio": 0.90,
+        "value_tau_e": 1.0,
+        "value_tau_s": 3.0,
+        "value_score_variant": "gestalt_structural",
+        "value_lambda_r": 1.0,
+        "gestalt_value_lambda": 0.0,
+        "normalization_low_quantile": 0.05,
+        "normalization_high_quantile": 0.95,
+        "knn_k": 12,
+    })()
+
+    assert validate_optimization_params(args) is args
+    args.gestalt_value_lambda = -0.1
+    with pytest.raises(ValueError, match="gestalt_value_lambda"):
+        validate_optimization_params(args)
+
+
+def test_gestalt_balance_alpha_validation():
+    args = type("Args", (), {
+        "proximity_selection_mode": "value_demand_rerank",
+        "proximity_growth_ratio": 0.1,
+        "value_rerank_fraction": 0.25,
+        "value_boundary_multiplier": 2.0,
+        "value_demand_ratio": 0.90,
+        "value_tau_e": 1.0,
+        "value_tau_s": 3.0,
+        "value_score_variant": "gestalt_balanced",
+        "value_lambda_r": 1.0,
+        "gestalt_value_lambda": 1.0,
+        "gestalt_balance_alpha": 0.5,
+        "normalization_low_quantile": 0.05,
+        "normalization_high_quantile": 0.95,
+        "knn_k": 12,
+    })()
+
+    assert validate_optimization_params(args) is args
+    for alpha in (-0.1, 1.1):
+        args.gestalt_balance_alpha = alpha
+        with pytest.raises(ValueError, match="gestalt_balance_alpha"):
+            validate_optimization_params(args)
 
 
 def test_value_demand_rerank_value_none_exact_a1_fallback():
@@ -1434,3 +1492,173 @@ def test_candidate_capacity_value_demand_exact_a1_fallbacks(value):
     assert stats.selected_indices == a1_stats.a1_indices
     assert stats.selected_src == a1_stats.selected_src
     assert stats.selected_new == a1_stats.selected_new
+
+
+def _timing_fixture():
+    candidate_mask = torch.ones(5, dtype=torch.bool)
+    dist = torch.tensor([200.0, 100.0, 95.0, 1.0, 0.0])
+    value = torch.tensor([0.0, 0.10, 0.90, 0.0, 0.0])
+    return candidate_mask, dist, value
+
+
+def test_value_timing_before_window_uses_proximity_topk_with_budget():
+    candidate_mask, dist, value = _timing_fixture()
+
+    selected_mask, stats = select_proximity_sources(
+        candidate_mask,
+        dist,
+        n=1,
+        rho=0.4,
+        enabled=True,
+        mode="value_demand_rerank",
+        value_score=value,
+        rerank_fraction=0.5,
+        value_rerank_start_iter=100,
+        value_rerank_end_iter=200,
+        iteration=50,
+    )
+
+    assert stats.requested_mode == "value_demand_rerank"
+    assert stats.mode == "proximity_topk"
+    assert stats.value_timing_active is False
+    assert stats.budget_active is True
+    assert stats.budget_new == 2
+    assert stats.selected_indices == (0, 1)
+    assert torch.equal(selected_mask, torch.tensor([True, True, False, False, False]))
+
+
+def test_value_timing_inside_window_uses_value_demand_rerank():
+    candidate_mask, dist, value = _timing_fixture()
+
+    selected_mask, stats = select_proximity_sources(
+        candidate_mask,
+        dist,
+        n=1,
+        rho=0.4,
+        enabled=True,
+        mode="value_demand_rerank",
+        value_score=value,
+        rerank_fraction=0.5,
+        value_rerank_start_iter=100,
+        value_rerank_end_iter=200,
+        iteration=150,
+    )
+
+    assert stats.mode == "value_demand_rerank"
+    assert stats.value_timing_active is True
+    assert stats.selected_indices == (0, 2)
+    assert stats.promotion_accepted == 1
+    assert torch.equal(selected_mask, torch.tensor([True, False, True, False, False]))
+
+
+def test_value_timing_after_window_restores_proximity_topk_with_budget():
+    candidate_mask, dist, value = _timing_fixture()
+
+    selected_mask, stats = select_proximity_sources(
+        candidate_mask,
+        dist,
+        n=1,
+        rho=0.4,
+        enabled=True,
+        mode="value_demand_rerank",
+        value_score=value,
+        rerank_fraction=0.5,
+        value_rerank_start_iter=100,
+        value_rerank_end_iter=200,
+        iteration=250,
+    )
+
+    assert stats.mode == "proximity_topk"
+    assert stats.value_timing_active is False
+    assert stats.budget_active is True
+    assert stats.budget_new == 2
+    assert stats.selected_indices == (0, 1)
+    assert torch.equal(selected_mask, torch.tensor([True, True, False, False, False]))
+
+
+def test_value_timing_default_params_preserve_legacy_value_demand_behavior():
+    parser = ArgumentParser()
+    OptimizationParams(parser)
+    args = parser.parse_args([])
+    assert args.value_rerank_start_iter == 0
+    assert args.value_rerank_end_iter == sys.maxsize
+
+    candidate_mask, dist, value = _timing_fixture()
+    selected_mask, stats = select_proximity_sources(
+        candidate_mask,
+        dist,
+        n=1,
+        rho=0.4,
+        enabled=True,
+        mode="value_demand_rerank",
+        value_score=value,
+        rerank_fraction=0.5,
+        value_rerank_start_iter=args.value_rerank_start_iter,
+        value_rerank_end_iter=args.value_rerank_end_iter,
+        iteration=50,
+    )
+
+    assert stats.mode == "value_demand_rerank"
+    assert stats.value_timing_active is True
+    assert stats.selected_indices == (0, 2)
+    assert torch.equal(selected_mask, torch.tensor([True, False, True, False, False]))
+
+
+def test_value_timing_start_after_end_raises_clear_value_error():
+    candidate_mask, dist, value = _timing_fixture()
+
+    with pytest.raises(ValueError, match="value_rerank_start_iter"):
+        select_proximity_sources(
+            candidate_mask,
+            dist,
+            n=1,
+            rho=0.4,
+            enabled=True,
+            mode="value_demand_rerank",
+            value_score=value,
+            value_rerank_start_iter=200,
+            value_rerank_end_iter=100,
+            iteration=150,
+        )
+
+    args = type("Args", (), {
+        "proximity_selection_mode": "value_demand_rerank",
+        "proximity_growth_ratio": 0.1,
+        "value_rerank_fraction": 0.25,
+        "value_rerank_start_iter": 200,
+        "value_rerank_end_iter": 100,
+        "value_boundary_multiplier": 2.0,
+        "value_demand_ratio": 0.90,
+        "value_tau_e": 1.0,
+        "value_tau_s": 3.0,
+        "value_lambda_r": 1.0,
+        "normalization_low_quantile": 0.05,
+        "normalization_high_quantile": 0.95,
+        "knn_k": 12,
+    })()
+    with pytest.raises(ValueError, match="value_rerank_start_iter"):
+        validate_optimization_params(args)
+
+
+def test_value_timing_log_contains_required_fields():
+    candidate_mask, dist, value = _timing_fixture()
+    _, stats = select_proximity_sources(
+        candidate_mask,
+        dist,
+        n=1,
+        rho=0.4,
+        enabled=True,
+        mode="value_demand_rerank",
+        value_score=value,
+        value_rerank_start_iter=100,
+        value_rerank_end_iter=200,
+        iteration=50,
+    )
+    log_line = format_value_timing_log(50, stats)
+
+    assert "[ValueTiming]" in log_line
+    assert "iter=50" in log_line
+    assert "active=False" in log_line
+    assert "start=100" in log_line
+    assert "end=200" in log_line
+    assert "effective_mode=proximity_topk" in log_line

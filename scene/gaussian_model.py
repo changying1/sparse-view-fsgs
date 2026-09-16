@@ -26,30 +26,55 @@ from utils.growth_budget import (
     format_proximity_budget_log,
     format_proximity_capacity_log,
     format_proximity_replay_log,
+    format_value_timing_log,
     format_value_promotion_diag,
     format_value_rerank_diag,
     parse_proximity_action_replay,
     requires_value_features,
+    resolve_value_timing_selection_mode,
     select_proximity_sources,
     resolve_proximity_selection_mode,
 )
 from utils.growth_diagnostics import (
     GrowthDiagnostics,
+    compute_child_structure_diagnostics,
     count_proximity_proposed,
     count_split_candidates,
+    format_child_structure_diag,
+    format_child_target_selection_log,
     format_proximity_growth_log,
+    select_structural_child_targets,
 )
 from utils.structural_graph import (
     build_knn_graph,
     compute_continuity_defect,
     compute_geometric_turning,
+    compute_good_continuation_edge_scores,
+    compute_good_continuation_score,
     compute_redundancy,
     estimate_gaussian_normals,
 )
-from utils.value_allocation import compute_obdkr_value, compute_structural_value_score
+from utils.value_allocation import (
+    compute_balanced_gestalt_value_score,
+    compute_defect_conditioned_gestalt_value_score,
+    compute_gestalt_structural_value_score,
+    compute_obdkr_value,
+    compute_structural_value_score,
+)
 from utils.value_diagnostics import (
+    compute_balanced_gestalt_diagnostics,
+    compute_defect_gestalt_counterfactual_diagnostics,
+    compute_defect_gestalt_diagnostics,
     compute_obdkr_diagnostics,
+    compute_gestalt_value_diagnostics,
     compute_structural_value_attribution_stats,
+    format_balanced_gestalt_diag,
+    format_balanced_gestalt_promotion_diag,
+    format_defect_gestalt_counterfactual_diag,
+    format_defect_gestalt_diag,
+    format_defect_gestalt_promotion_diag,
+    format_gestalt_promotion_diag,
+    format_gestalt_value_diag,
     format_obdkr_diagnostics_log,
     format_structural_boundary_diag,
     format_structural_norm_diag,
@@ -645,6 +670,7 @@ class GaussianModel:
         candidate_mask=None,
         iteration=None,
         knn_k=12,
+        proximity_neighbor_indices=None,
         **kwargs,
     ):
         visible_count = self.visible_view_count
@@ -660,8 +686,17 @@ class GaussianModel:
         if recent_visible_count is not None and recent_visible_count.shape[0] != self.get_xyz.shape[0]:
             raise ValueError("recent_visible_view_count must match current Gaussian count.")
         value_score_variant = kwargs.get("value_score_variant", getattr(self.args, "value_score_variant", "obdkr"))
-        if value_score_variant not in ("obdkr", "structural"):
-            raise ValueError("value_score_variant must be one of obdkr, structural")
+        if value_score_variant not in (
+            "obdkr",
+            "structural",
+            "gestalt_structural",
+            "gestalt_balanced",
+            "gestalt_defect_conditioned",
+        ):
+            raise ValueError(
+                "value_score_variant must be one of obdkr, structural, "
+                "gestalt_structural, gestalt_balanced, gestalt_defect_conditioned"
+            )
         observation_source = getattr(self.args, "value_observation_source", "lifetime")
         active_observation_count = None
         if value_score_variant == "obdkr":
@@ -707,13 +742,79 @@ class GaussianModel:
                 tau_s=kwargs.get("tau_s", getattr(self.args, "value_tau_s", 3.0)),
                 **value_kwargs,
             )
-        else:
+        elif value_score_variant == "structural":
             components = compute_structural_value_score(
                 boundary,
                 turning,
                 defect,
                 redundancy,
                 **value_kwargs,
+            )
+        elif value_score_variant == "gestalt_structural":
+            if proximity_neighbor_indices is None:
+                raise ValueError("gestalt_structural value requires proximity_neighbor_indices.")
+            good_continuation = compute_good_continuation_score(
+                self.get_xyz.detach(),
+                normals,
+                proximity_neighbor_indices.detach().long(),
+            )
+            components = compute_gestalt_structural_value_score(
+                boundary,
+                turning,
+                defect,
+                redundancy,
+                good_continuation,
+                gestalt_lambda=kwargs.get(
+                    "gestalt_lambda",
+                    getattr(self.args, "gestalt_value_lambda", 1.0),
+                ),
+                **value_kwargs,
+            )
+        elif value_score_variant == "gestalt_balanced":
+            if proximity_neighbor_indices is None:
+                raise ValueError("gestalt_balanced value requires proximity_neighbor_indices.")
+            good_continuation = compute_good_continuation_score(
+                self.get_xyz.detach(),
+                normals,
+                proximity_neighbor_indices.detach().long(),
+            )
+            components = compute_balanced_gestalt_value_score(
+                boundary,
+                turning,
+                defect,
+                redundancy,
+                good_continuation,
+                low_quantile=value_kwargs["low_quantile"],
+                high_quantile=value_kwargs["high_quantile"],
+                normalization_mask=value_kwargs["normalization_mask"],
+                gestalt_balance_alpha=kwargs.get(
+                    "gestalt_balance_alpha",
+                    getattr(self.args, "gestalt_balance_alpha", 0.5),
+                ),
+                return_components=True,
+            )
+        else:
+            if proximity_neighbor_indices is None:
+                raise ValueError("gestalt_defect_conditioned value requires proximity_neighbor_indices.")
+            good_continuation = compute_good_continuation_score(
+                self.get_xyz.detach(),
+                normals,
+                proximity_neighbor_indices.detach().long(),
+            )
+            components = compute_defect_conditioned_gestalt_value_score(
+                boundary,
+                turning,
+                defect,
+                redundancy,
+                good_continuation,
+                low_quantile=value_kwargs["low_quantile"],
+                high_quantile=value_kwargs["high_quantile"],
+                normalization_mask=value_kwargs["normalization_mask"],
+                gestalt_lambda=kwargs.get(
+                    "gestalt_lambda",
+                    getattr(self.args, "gestalt_value_lambda", 1.0),
+                ),
+                return_components=True,
             )
         if iteration is not None:
             print(
@@ -749,6 +850,7 @@ class GaussianModel:
         proximity_sources = int(selected_pts_mask.sum().item())
         proximity_candidate_mask = selected_pts_mask
         proximity_proposed = count_proximity_proposed(proximity_sources, N)
+        value_components = None
         print(
             format_proximity_growth_log(
                 iteration=iteration,
@@ -767,7 +869,15 @@ class GaussianModel:
             or getattr(self.args, "enable_proximity_candidate_capacity", False)
             or replay_enabled,
         )
-        if requires_value_features(proximity_selection_mode):
+        value_rerank_start_iter = getattr(self.args, "value_rerank_start_iter", 0)
+        value_rerank_end_iter = getattr(self.args, "value_rerank_end_iter", None)
+        effective_proximity_selection_mode, _ = resolve_value_timing_selection_mode(
+            proximity_selection_mode,
+            iteration=iteration,
+            start_iter=value_rerank_start_iter,
+            end_iter=value_rerank_end_iter,
+        )
+        if requires_value_features(effective_proximity_selection_mode):
             value_components = self.compute_fsgs_proximity_candidate_value(
                 train_cameras=train_cameras,
                 edge_maps=edge_maps,
@@ -783,11 +893,12 @@ class GaussianModel:
                 high_quantile=getattr(self.args, "normalization_high_quantile", 0.95),
                 value_score_variant=getattr(self.args, "value_score_variant", "obdkr"),
                 knn_k=getattr(self.args, "knn_k", 12),
+                proximity_neighbor_indices=nearest_indices,
+                gestalt_lambda=getattr(self.args, "gestalt_value_lambda", 1.0),
+                gestalt_balance_alpha=getattr(self.args, "gestalt_balance_alpha", 0.5),
             )
             value_score = value_components["U"]
-        selected_pts_mask, budget_stats = select_proximity_sources(
-            selected_pts_mask,
-            dist,
+        selection_kwargs = dict(
             n=N,
             rho=getattr(self.args, "proximity_growth_ratio", 0.10),
             enabled=getattr(self.args, "enable_proximity_budget", False),
@@ -800,13 +911,58 @@ class GaussianModel:
             candidate_keep_ratio=getattr(self.args, "proximity_candidate_keep_ratio", 0.80),
             replay_schedule=replay_schedule,
             iteration=iteration,
+            value_rerank_start_iter=value_rerank_start_iter,
+            value_rerank_end_iter=value_rerank_end_iter,
+        )
+        selected_pts_mask, budget_stats = select_proximity_sources(
+            selected_pts_mask,
+            dist,
+            **selection_kwargs,
         )
         print(format_proximity_budget_log(iteration, budget_stats), flush=True)
         if budget_stats.capacity_active:
             print(format_proximity_capacity_log(iteration, budget_stats), flush=True)
         if budget_stats.replay_active:
             print(format_proximity_replay_log(iteration, budget_stats), flush=True)
+        if budget_stats.requested_mode == "value_demand_rerank":
+            print(format_value_timing_log(iteration, budget_stats), flush=True)
         print(format_value_rerank_diag(iteration, budget_stats), flush=True)
+        gestalt_stats = None
+        if (
+            budget_stats.mode == "value_demand_rerank"
+            and getattr(self.args, "value_score_variant", "obdkr") == "gestalt_structural"
+        ):
+            gestalt_stats = compute_gestalt_value_diagnostics(
+                iteration,
+                value_components,
+                proximity_candidate_mask,
+                budget_stats,
+            )
+            print(format_gestalt_value_diag(gestalt_stats), flush=True)
+        balanced_gestalt_stats = None
+        if (
+            budget_stats.mode == "value_demand_rerank"
+            and getattr(self.args, "value_score_variant", "obdkr") == "gestalt_balanced"
+        ):
+            balanced_gestalt_stats = compute_balanced_gestalt_diagnostics(
+                iteration,
+                value_components,
+                proximity_candidate_mask,
+                budget_stats,
+            )
+            print(format_balanced_gestalt_diag(balanced_gestalt_stats), flush=True)
+        defect_gestalt_stats = None
+        if (
+            budget_stats.mode == "value_demand_rerank"
+            and getattr(self.args, "value_score_variant", "obdkr") == "gestalt_defect_conditioned"
+        ):
+            defect_gestalt_stats = compute_defect_gestalt_diagnostics(
+                iteration,
+                value_components,
+                proximity_candidate_mask,
+                budget_stats,
+            )
+            print(format_defect_gestalt_diag(defect_gestalt_stats), flush=True)
         capacity_limited = budget_stats.budget_hit or budget_stats.capacity_hit or (
             budget_stats.replay_active and budget_stats.selected_src < budget_stats.candidates
         )
@@ -828,8 +984,113 @@ class GaussianModel:
                 print(format_structural_norm_diag(structural_stats), flush=True)
                 print(format_structural_boundary_diag(structural_stats), flush=True)
                 print(format_structural_promotion_attr(structural_stats), flush=True)
+            if getattr(self.args, "value_score_variant", "obdkr") == "gestalt_structural":
+                if gestalt_stats is None:
+                    gestalt_stats = compute_gestalt_value_diagnostics(
+                        iteration,
+                        value_components,
+                        proximity_candidate_mask,
+                        budget_stats,
+                    )
+                print(format_gestalt_promotion_diag(gestalt_stats), flush=True)
+            if getattr(self.args, "value_score_variant", "obdkr") == "gestalt_balanced":
+                if balanced_gestalt_stats is None:
+                    balanced_gestalt_stats = compute_balanced_gestalt_diagnostics(
+                        iteration,
+                        value_components,
+                        proximity_candidate_mask,
+                        budget_stats,
+                    )
+                print(format_balanced_gestalt_promotion_diag(balanced_gestalt_stats), flush=True)
+            if getattr(self.args, "value_score_variant", "obdkr") == "gestalt_defect_conditioned":
+                if defect_gestalt_stats is None:
+                    defect_gestalt_stats = compute_defect_gestalt_diagnostics(
+                        iteration,
+                        value_components,
+                        proximity_candidate_mask,
+                        budget_stats,
+                    )
+                print(format_defect_gestalt_promotion_diag(defect_gestalt_stats), flush=True)
+                kd_selected_mask, kd_budget_stats = select_proximity_sources(
+                    proximity_candidate_mask,
+                    dist,
+                    **{
+                        **selection_kwargs,
+                        "value_score": value_components["U_base"],
+                    },
+                )
+                counterfactual_stats = compute_defect_gestalt_counterfactual_diagnostics(
+                    iteration,
+                    value_components,
+                    proximity_candidate_mask,
+                    selected_pts_mask,
+                    budget_stats,
+                    kd_selected_mask,
+                    kd_budget_stats,
+                    dist,
+                )
+                print(format_defect_gestalt_counterfactual_diag(counterfactual_stats), flush=True)
 
-        new_indices = nearest_indices[selected_pts_mask].reshape(-1).long()
+        child_structure_diagnostics_enabled = getattr(self.args, "enable_child_structure_diagnostics", False)
+        structural_child_target_selection_enabled = getattr(
+            self.args,
+            "enable_structural_child_target_selection",
+            False,
+        )
+        current_edge_scores = None
+        pool_edge_scores = None
+        pool_neighbors = None
+        normals = None
+        if child_structure_diagnostics_enabled or structural_child_target_selection_enabled:
+            normals = estimate_gaussian_normals(
+                self.get_scaling.detach(),
+                self._rotation.detach(),
+            )
+            current_edge_scores = compute_good_continuation_edge_scores(
+                self.get_xyz.detach(),
+                normals,
+                nearest_indices.detach().long(),
+            )
+            pool_neighbors = build_knn_graph(
+                self.get_xyz.detach(),
+                k=12 if structural_child_target_selection_enabled else getattr(self.args, "knn_k", 12),
+            )
+            pool_edge_scores = compute_good_continuation_edge_scores(
+                self.get_xyz.detach(),
+                normals,
+                pool_neighbors,
+            )
+
+        target_indices = nearest_indices[selected_pts_mask].long()
+        if structural_child_target_selection_enabled:
+            target_indices, target_selection_stats = select_structural_child_targets(
+                selected_pts_mask,
+                current_edge_scores,
+                pool_edge_scores,
+                nearest_indices,
+                pool_neighbors,
+                self.get_xyz.detach(),
+            )
+            print(format_child_target_selection_log(iteration, target_selection_stats), flush=True)
+
+        if child_structure_diagnostics_enabled:
+            print(
+                format_child_structure_diag(
+                    compute_child_structure_diagnostics(
+                        iteration,
+                        selected_pts_mask,
+                        current_edge_scores,
+                        pool_edge_scores,
+                        nearest_indices,
+                        pool_neighbors,
+                        value_components=value_components,
+                        xyz=self.get_xyz.detach(),
+                    )
+                ),
+                flush=True,
+            )
+
+        new_indices = target_indices.reshape(-1).long()
         source_xyz = self._xyz[selected_pts_mask][:, None, :].repeat(1, N, 1).reshape(-1, 3)
         target_xyz = self._xyz[new_indices]
         new_xyz = (source_xyz + target_xyz) / 2

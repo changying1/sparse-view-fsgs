@@ -104,6 +104,8 @@ class OptimizationParams(ParamGroup):
         self.proximity_action_replay = ""
         self.proximity_selection_mode = "original"
         self.value_rerank_fraction = 0.25
+        self.value_rerank_start_iter = 0
+        self.value_rerank_end_iter = sys.maxsize
         self.value_boundary_multiplier = 2.0
         self.value_demand_ratio = 0.90
         self.value_tau_e = 1.0
@@ -114,6 +116,11 @@ class OptimizationParams(ParamGroup):
         self.value_w_k = 1.0
         self.value_w_d = 1.0
         self.value_lambda_r = 1.0
+        self.gestalt_value_lambda = 1.0
+        self.gestalt_balance_alpha = 0.5
+        self.enable_child_structure_diagnostics = False
+        self.enable_structural_child_target_selection = False
+        self.enable_observation_evidence_diagnostics = False
         self.normalization_low_quantile = 0.05
         self.normalization_high_quantile = 0.95
         self.knn_k = 12
@@ -154,6 +161,10 @@ def validate_optimization_params(args):
         raise ValueError("proximity_candidate_keep_ratio must satisfy 0 < ratio <= 1")
     if not (0 <= float(getattr(args, "value_rerank_fraction", 0.25)) <= 1):
         raise ValueError("value_rerank_fraction must satisfy 0 <= value_rerank_fraction <= 1")
+    value_rerank_start_iter = int(getattr(args, "value_rerank_start_iter", 0))
+    value_rerank_end_iter = int(getattr(args, "value_rerank_end_iter", sys.maxsize))
+    if value_rerank_start_iter > value_rerank_end_iter:
+        raise ValueError("value_rerank_start_iter must be <= value_rerank_end_iter")
     if float(getattr(args, "value_boundary_multiplier", 2.0)) < 1:
         raise ValueError("value_boundary_multiplier must be at least 1")
     if not (0 < float(getattr(args, "value_demand_ratio", 0.90)) <= 1):
@@ -166,10 +177,23 @@ def validate_optimization_params(args):
     if observation_source not in ("lifetime", "recent"):
         raise ValueError("value_observation_source must be one of lifetime, recent")
     score_variant = getattr(args, "value_score_variant", "obdkr")
-    if score_variant not in ("obdkr", "structural"):
-        raise ValueError("value_score_variant must be one of obdkr, structural")
+    if score_variant not in (
+        "obdkr",
+        "structural",
+        "gestalt_structural",
+        "gestalt_balanced",
+        "gestalt_defect_conditioned",
+    ):
+        raise ValueError(
+            "value_score_variant must be one of obdkr, structural, "
+            "gestalt_structural, gestalt_balanced, gestalt_defect_conditioned"
+        )
     if float(getattr(args, "value_lambda_r", 1.0)) < 0:
         raise ValueError("value_lambda_r must be non-negative")
+    if float(getattr(args, "gestalt_value_lambda", 1.0)) < 0:
+        raise ValueError("gestalt_value_lambda must be non-negative")
+    if not (0 <= float(getattr(args, "gestalt_balance_alpha", 0.5)) <= 1):
+        raise ValueError("gestalt_balance_alpha must satisfy 0 <= alpha <= 1")
     low = float(getattr(args, "normalization_low_quantile", 0.05))
     high = float(getattr(args, "normalization_high_quantile", 0.95))
     if not (0 <= low < high <= 1):

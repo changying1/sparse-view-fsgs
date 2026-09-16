@@ -135,6 +135,166 @@ def compute_structural_value_score(boundary, turning, defect, redundancy,
         return value
 
 
+def compute_gestalt_structural_value_score(boundary, turning, defect, redundancy,
+                                           good_continuation,
+                                           w_b=1.0, w_k=1.0, w_d=1.0,
+                                           lambda_r=1.0, low_quantile=0.05, high_quantile=0.95,
+                                           normalization_mask=None,
+                                           gestalt_lambda=1.0,
+                                           return_components=False):
+    with torch.no_grad():
+        if float(gestalt_lambda) < 0:
+            raise ValueError("gestalt_value_lambda must be non-negative.")
+        _validate_same_shape(boundary, turning, defect, redundancy, good_continuation)
+        components = compute_structural_value_score(
+            boundary,
+            turning,
+            defect,
+            redundancy,
+            w_b=w_b,
+            w_k=w_k,
+            w_d=w_d,
+            lambda_r=lambda_r,
+            low_quantile=low_quantile,
+            high_quantile=high_quantile,
+            normalization_mask=normalization_mask,
+            return_components=True,
+        )
+        g = torch.nan_to_num(
+            good_continuation.to(device=components["U"].device, dtype=torch.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        base_u = components["U"]
+        value = torch.nan_to_num(
+            base_u * (1.0 + float(gestalt_lambda) * g),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if return_components:
+            components["G"] = g
+            components["U_base"] = base_u
+            components["U"] = value
+            components["gestalt_lambda"] = float(gestalt_lambda)
+            return components
+        return value
+
+
+def compute_balanced_gestalt_value_score(boundary, turning, defect, redundancy,
+                                         good_continuation,
+                                         w_b=0.0, w_k=1.0, w_d=1.0,
+                                         lambda_r=0.0, low_quantile=0.05, high_quantile=0.95,
+                                         normalization_mask=None,
+                                         gestalt_balance_alpha=0.5,
+                                         return_components=False):
+    with torch.no_grad():
+        alpha = float(gestalt_balance_alpha)
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError("gestalt_balance_alpha must satisfy 0 <= alpha <= 1.")
+        _validate_same_shape(boundary, turning, defect, redundancy, good_continuation)
+        components = compute_structural_value_score(
+            boundary,
+            turning,
+            defect,
+            redundancy,
+            w_b=0.0,
+            w_k=1.0,
+            w_d=1.0,
+            lambda_r=0.0,
+            low_quantile=low_quantile,
+            high_quantile=high_quantile,
+            normalization_mask=normalization_mask,
+            return_components=True,
+        )
+        k = torch.nan_to_num(components["K_norm"].to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        d = torch.nan_to_num(components["D_norm"].to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        g = torch.nan_to_num(
+            good_continuation.to(device=components["U"].device, dtype=torch.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        s_need = torch.nan_to_num(0.5 * (k + d), nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+        value = torch.nan_to_num(
+            (1.0 - alpha) * s_need + alpha * g,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if return_components:
+            components["K"] = k
+            components["D"] = d
+            components["G"] = g
+            components["S_need"] = s_need
+            components["U"] = value
+            components["gestalt_balance_alpha"] = alpha
+            components["balanced_w_b"] = float(w_b)
+            components["balanced_w_k"] = float(w_k)
+            components["balanced_w_d"] = float(w_d)
+            components["balanced_lambda_r"] = float(lambda_r)
+            return components
+        return value
+
+
+def compute_defect_conditioned_gestalt_value_score(boundary, turning, defect, redundancy,
+                                                   good_continuation,
+                                                   w_b=0.0, w_k=1.0, w_d=1.0,
+                                                   lambda_r=0.0, low_quantile=0.05, high_quantile=0.95,
+                                                   normalization_mask=None,
+                                                   gestalt_lambda=1.0,
+                                                   return_components=False):
+    with torch.no_grad():
+        if float(gestalt_lambda) < 0:
+            raise ValueError("gestalt_value_lambda must be non-negative.")
+        _validate_same_shape(boundary, turning, defect, redundancy, good_continuation)
+        components = compute_structural_value_score(
+            boundary,
+            turning,
+            defect,
+            redundancy,
+            w_b=0.0,
+            w_k=1.0,
+            w_d=1.0,
+            lambda_r=0.0,
+            low_quantile=low_quantile,
+            high_quantile=high_quantile,
+            normalization_mask=normalization_mask,
+            return_components=True,
+        )
+        k = torch.nan_to_num(components["K_norm"].to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        d = torch.nan_to_num(components["D_norm"].to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        g = torch.nan_to_num(
+            good_continuation.to(device=components["U"].device, dtype=torch.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        dg = torch.nan_to_num(d * g, nan=0.0, posinf=0.0, neginf=0.0)
+        base_u = torch.nan_to_num(k + d, nan=0.0, posinf=0.0, neginf=0.0)
+        value = torch.nan_to_num(
+            base_u + float(gestalt_lambda) * dg,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if return_components:
+            components["K"] = k
+            components["D"] = d
+            components["G"] = g
+            components["DG"] = dg
+            components["U_base"] = base_u
+            components["U"] = value
+            components["gestalt_lambda"] = float(gestalt_lambda)
+            components["conditioned_w_b"] = float(w_b)
+            components["conditioned_w_k"] = float(w_k)
+            components["conditioned_w_d"] = float(w_d)
+            components["conditioned_lambda_r"] = float(lambda_r)
+            return components
+        return value
+
+
 def allocate_budget(utility, budget, candidate_mask=None, return_mask=False):
     with torch.no_grad():
         if not torch.is_tensor(utility) or utility.ndim != 1:

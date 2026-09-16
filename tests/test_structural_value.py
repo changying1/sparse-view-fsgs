@@ -3,10 +3,18 @@ import sys
 import types
 from argparse import Namespace
 
+import pytest
 import torch
 
 from utils.growth_budget import select_proximity_sources
-from utils.value_allocation import compute_obdkr_value, compute_structural_value_score, robust_normalize
+from utils.value_allocation import (
+    compute_balanced_gestalt_value_score,
+    compute_defect_conditioned_gestalt_value_score,
+    compute_gestalt_structural_value_score,
+    compute_obdkr_value,
+    compute_structural_value_score,
+    robust_normalize,
+)
 from utils.value_diagnostics import compute_obdkr_diagnostics, format_obdkr_diagnostics_log
 
 
@@ -161,3 +169,371 @@ def test_structural_recent_observation_source_does_not_require_recent_state(monk
 
     assert components["U"].shape == (4,)
     assert torch.isfinite(components["U"]).all()
+
+
+def test_gestalt_structural_lambda_zero_matches_structural_kdonly():
+    boundary = torch.tensor([0.0, 0.0, 0.0])
+    turning = torch.tensor([1.0, 2.0, 3.0])
+    defect = torch.tensor([3.0, 2.0, 1.0])
+    redundancy = torch.zeros(3)
+    good_continuation = torch.tensor([0.0, 0.5, 1.0])
+
+    structural = compute_structural_value_score(
+        boundary,
+        turning,
+        defect,
+        redundancy,
+        w_b=0.0,
+        w_k=1.0,
+        w_d=1.0,
+        lambda_r=0.0,
+        low_quantile=0.0,
+        high_quantile=1.0,
+    )
+    gestalt = compute_gestalt_structural_value_score(
+        boundary,
+        turning,
+        defect,
+        redundancy,
+        good_continuation,
+        w_b=0.0,
+        w_k=1.0,
+        w_d=1.0,
+        lambda_r=0.0,
+        low_quantile=0.0,
+        high_quantile=1.0,
+        gestalt_lambda=0.0,
+    )
+
+    assert torch.equal(gestalt, structural)
+
+
+def test_gestalt_structural_g_zero_equals_base_u():
+    boundary = torch.tensor([0.0, 0.0, 0.0])
+    turning = torch.tensor([1.0, 2.0, 3.0])
+    defect = torch.tensor([3.0, 2.0, 1.0])
+    redundancy = torch.zeros(3)
+
+    components = compute_gestalt_structural_value_score(
+        boundary,
+        turning,
+        defect,
+        redundancy,
+        torch.zeros(3),
+        w_b=0.0,
+        w_k=1.0,
+        w_d=1.0,
+        lambda_r=0.0,
+        low_quantile=0.0,
+        high_quantile=1.0,
+        return_components=True,
+    )
+
+    assert torch.equal(components["U"], components["U_base"])
+
+
+def test_gestalt_structural_g_one_lambda_one_doubles_base_u():
+    boundary = torch.tensor([0.0, 0.0, 0.0])
+    turning = torch.tensor([1.0, 2.0, 3.0])
+    defect = torch.tensor([3.0, 2.0, 1.0])
+    redundancy = torch.zeros(3)
+
+    components = compute_gestalt_structural_value_score(
+        boundary,
+        turning,
+        defect,
+        redundancy,
+        torch.ones(3),
+        w_b=0.0,
+        w_k=1.0,
+        w_d=1.0,
+        lambda_r=0.0,
+        low_quantile=0.0,
+        high_quantile=1.0,
+        gestalt_lambda=1.0,
+        return_components=True,
+    )
+
+    assert torch.allclose(components["U"], 2.0 * components["U_base"])
+
+
+def test_gestalt_structural_nan_inf_protection():
+    components = compute_gestalt_structural_value_score(
+        torch.tensor([0.0, float("nan"), 2.0]),
+        torch.tensor([1.0, float("inf"), 3.0]),
+        torch.tensor([3.0, 2.0, float("-inf")]),
+        torch.tensor([0.0, 1.0, 2.0]),
+        torch.tensor([0.0, float("nan"), float("inf")]),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        return_components=True,
+    )
+
+    assert torch.isfinite(components["U"]).all()
+    assert torch.isfinite(components["G"]).all()
+    assert ((components["G"] >= 0.0) & (components["G"] <= 1.0)).all()
+
+
+def test_gestalt_structural_rejects_negative_lambda():
+    with pytest.raises(ValueError, match="gestalt_value_lambda"):
+        compute_gestalt_structural_value_score(
+            torch.ones(2),
+            torch.ones(2),
+            torch.ones(2),
+            torch.zeros(2),
+            torch.ones(2),
+            gestalt_lambda=-1.0,
+        )
+
+
+def test_balanced_gestalt_alpha_zero_equals_s_need():
+    boundary = torch.zeros(3)
+    turning = torch.tensor([0.0, 0.5, 1.0])
+    defect = torch.tensor([1.0, 0.5, 0.0])
+    redundancy = torch.ones(3)
+    components = compute_balanced_gestalt_value_score(
+        boundary,
+        turning,
+        defect,
+        redundancy,
+        torch.tensor([0.0, 0.5, 1.0]),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        gestalt_balance_alpha=0.0,
+        return_components=True,
+    )
+
+    expected = 0.5 * (components["K_norm"] + components["D_norm"])
+    assert torch.allclose(components["S_need"], expected)
+    assert torch.equal(components["U"], components["S_need"])
+
+
+def test_balanced_gestalt_alpha_one_equals_g():
+    components = compute_balanced_gestalt_value_score(
+        torch.zeros(3),
+        torch.tensor([0.0, 0.5, 1.0]),
+        torch.tensor([1.0, 0.5, 0.0]),
+        torch.zeros(3),
+        torch.tensor([0.0, 0.5, 1.0]),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        gestalt_balance_alpha=1.0,
+        return_components=True,
+    )
+
+    assert torch.equal(components["U"], components["G"])
+
+
+def test_balanced_gestalt_alpha_half_balances_need_and_continuation():
+    components = compute_balanced_gestalt_value_score(
+        torch.zeros(2),
+        torch.tensor([1.0, 0.0]),
+        torch.tensor([1.0, 0.0]),
+        torch.zeros(2),
+        torch.tensor([0.0, 1.0]),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        gestalt_balance_alpha=0.5,
+        return_components=True,
+    )
+
+    assert torch.allclose(components["S_need"], torch.tensor([1.0, 0.0]))
+    assert torch.allclose(components["U"], torch.tensor([0.5, 0.5]))
+
+
+def test_balanced_gestalt_high_g_can_beat_high_kd_low_g():
+    components = compute_balanced_gestalt_value_score(
+        torch.zeros(3),
+        torch.tensor([0.0, 0.6, 1.0]),
+        torch.tensor([0.0, 0.6, 1.0]),
+        torch.zeros(3),
+        torch.tensor([0.0, 1.0, 0.0]),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        gestalt_balance_alpha=0.5,
+        return_components=True,
+    )
+
+    assert components["S_need"][1].item() == pytest.approx(0.6)
+    assert components["S_need"][2].item() == pytest.approx(1.0)
+    assert components["U"][1].item() == pytest.approx(0.8)
+    assert components["U"][2].item() == pytest.approx(0.5)
+    assert torch.argsort(components["U"], descending=True).tolist()[:2] == [1, 2]
+
+
+def test_balanced_gestalt_alpha_bounds():
+    for alpha in (-0.1, 1.1):
+        with pytest.raises(ValueError, match="gestalt_balance_alpha"):
+            compute_balanced_gestalt_value_score(
+                torch.ones(2),
+                torch.ones(2),
+                torch.ones(2),
+                torch.zeros(2),
+                torch.ones(2),
+                gestalt_balance_alpha=alpha,
+            )
+
+
+def test_balanced_gestalt_nan_inf_protection():
+    components = compute_balanced_gestalt_value_score(
+        torch.tensor([0.0, float("nan"), 2.0]),
+        torch.tensor([1.0, float("inf"), 3.0]),
+        torch.tensor([3.0, 2.0, float("-inf")]),
+        torch.tensor([0.0, 1.0, 2.0]),
+        torch.tensor([0.0, float("nan"), float("inf")]),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        return_components=True,
+    )
+
+    assert torch.isfinite(components["U"]).all()
+    assert torch.isfinite(components["G"]).all()
+    assert torch.isfinite(components["S_need"]).all()
+
+
+def test_defect_conditioned_gestalt_lambda_zero_matches_kdonly():
+    boundary = torch.zeros(3)
+    turning = torch.tensor([0.0, 0.5, 1.0])
+    defect = torch.tensor([1.0, 0.5, 0.0])
+    redundancy = torch.ones(3)
+    good_continuation = torch.tensor([0.0, 0.5, 1.0])
+
+    structural = compute_structural_value_score(
+        boundary,
+        turning,
+        defect,
+        redundancy,
+        w_b=0.0,
+        w_k=1.0,
+        w_d=1.0,
+        lambda_r=0.0,
+        low_quantile=0.0,
+        high_quantile=1.0,
+    )
+    conditioned = compute_defect_conditioned_gestalt_value_score(
+        boundary,
+        turning,
+        defect,
+        redundancy,
+        good_continuation,
+        low_quantile=0.0,
+        high_quantile=1.0,
+        gestalt_lambda=0.0,
+    )
+
+    assert torch.equal(conditioned, structural)
+
+
+def test_defect_conditioned_gestalt_g_zero_equals_k_plus_d():
+    components = compute_defect_conditioned_gestalt_value_score(
+        torch.zeros(3),
+        torch.tensor([0.0, 0.5, 1.0]),
+        torch.tensor([1.0, 0.5, 0.0]),
+        torch.zeros(3),
+        torch.zeros(3),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        return_components=True,
+    )
+
+    assert torch.equal(components["U"], components["U_base"])
+
+
+def test_defect_conditioned_gestalt_d_zero_does_not_gain_from_g():
+    components = compute_defect_conditioned_gestalt_value_score(
+        torch.zeros(3),
+        torch.tensor([0.0, 0.4, 1.0]),
+        torch.zeros(3),
+        torch.zeros(3),
+        torch.ones(3),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        return_components=True,
+    )
+
+    assert components["D"][1].item() == pytest.approx(0.0)
+    assert components["G"][1].item() == pytest.approx(1.0)
+    assert components["U"][1].item() == pytest.approx(0.4)
+
+
+def test_defect_conditioned_gestalt_d_one_g_one_lambda_one():
+    components = compute_defect_conditioned_gestalt_value_score(
+        torch.zeros(3),
+        torch.tensor([0.0, 0.3, 1.0]),
+        torch.tensor([0.0, 1.0, 0.5]),
+        torch.zeros(3),
+        torch.tensor([0.0, 1.0, 0.0]),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        gestalt_lambda=1.0,
+        return_components=True,
+    )
+
+    assert components["K"][1].item() == pytest.approx(0.3)
+    assert components["D"][1].item() == pytest.approx(1.0)
+    assert components["G"][1].item() == pytest.approx(1.0)
+    assert components["U"][1].item() == pytest.approx(2.3)
+
+
+def test_defect_conditioned_gestalt_high_g_low_defect_does_not_win_by_itself():
+    components = compute_defect_conditioned_gestalt_value_score(
+        torch.zeros(4),
+        torch.zeros(4),
+        torch.tensor([0.0, 0.2, 0.6, 1.0]),
+        torch.zeros(4),
+        torch.tensor([0.0, 1.0, 0.0, 0.0]),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        gestalt_lambda=1.0,
+        return_components=True,
+    )
+
+    assert components["U"][1].item() == pytest.approx(0.4)
+    assert components["U"][2].item() == pytest.approx(0.6)
+    assert components["U"][2].item() > components["U"][1].item()
+
+
+def test_defect_conditioned_gestalt_high_g_wins_when_defect_matches():
+    components = compute_defect_conditioned_gestalt_value_score(
+        torch.zeros(4),
+        torch.zeros(4),
+        torch.tensor([0.0, 0.5, 0.5, 1.0]),
+        torch.zeros(4),
+        torch.tensor([0.0, 1.0, 0.0, 0.0]),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        gestalt_lambda=1.0,
+        return_components=True,
+    )
+
+    assert components["D"][1].item() == pytest.approx(0.5)
+    assert components["D"][2].item() == pytest.approx(0.5)
+    assert components["U"][1].item() > components["U"][2].item()
+
+
+def test_defect_conditioned_gestalt_nan_inf_protection():
+    components = compute_defect_conditioned_gestalt_value_score(
+        torch.tensor([0.0, float("nan"), 2.0]),
+        torch.tensor([1.0, float("inf"), 3.0]),
+        torch.tensor([3.0, 2.0, float("-inf")]),
+        torch.tensor([0.0, 1.0, 2.0]),
+        torch.tensor([0.0, float("nan"), float("inf")]),
+        low_quantile=0.0,
+        high_quantile=1.0,
+        return_components=True,
+    )
+
+    for name in ("K", "D", "G", "DG", "U"):
+        assert torch.isfinite(components[name]).all()
+
+
+def test_defect_conditioned_gestalt_rejects_negative_lambda():
+    with pytest.raises(ValueError, match="gestalt_value_lambda"):
+        compute_defect_conditioned_gestalt_value_score(
+            torch.ones(2),
+            torch.ones(2),
+            torch.ones(2),
+            torch.zeros(2),
+            torch.ones(2),
+            gestalt_lambda=-1.0,
+        )

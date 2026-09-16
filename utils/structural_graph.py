@@ -111,6 +111,43 @@ def compute_redundancy(xyz, scales, neighbor_indices, eps=1e-8):
     return torch.nan_to_num(torch.exp(-dist2 / (2.0 * overlap_scale.clamp_min(eps).pow(2))).sum(dim=-1), nan=0.0)
 
 
+def compute_good_continuation_edge_scores(xyz, normals, proximity_neighbor_indices, eps=1e-8):
+    with torch.no_grad():
+        _validate_xyz(xyz)
+        _validate_normals(normals, xyz.shape[0])
+        _validate_neighbors(proximity_neighbor_indices, xyz.shape[0])
+        if proximity_neighbor_indices.shape[1] == 0:
+            return torch.empty((xyz.shape[0], 0), dtype=xyz.dtype, device=xyz.device)
+
+        source_xyz = xyz.detach()
+        source_normals = F.normalize(normals.detach().to(device=xyz.device, dtype=xyz.dtype), dim=-1, eps=eps)
+        neighbor_indices = proximity_neighbor_indices.to(device=xyz.device)
+        target_xyz = source_xyz[neighbor_indices]
+        target_normals = source_normals[neighbor_indices]
+
+        offsets = target_xyz - source_xyz[:, None, :]
+        directions = F.normalize(offsets, dim=-1, eps=eps)
+        normal_agreement = (source_normals[:, None, :] * target_normals).sum(dim=-1).abs()
+        source_tangent = 1.0 - (source_normals[:, None, :] * directions).sum(dim=-1).abs()
+        target_tangent = 1.0 - (target_normals * directions).sum(dim=-1).abs()
+        continuation = normal_agreement * source_tangent * target_tangent
+        return torch.nan_to_num(continuation, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+
+
+def compute_good_continuation_score(xyz, normals, proximity_neighbor_indices, eps=1e-8):
+    with torch.no_grad():
+        edge_scores = compute_good_continuation_edge_scores(
+            xyz,
+            normals,
+            proximity_neighbor_indices,
+            eps=eps,
+        )
+        if edge_scores.shape[1] == 0:
+            return torch.zeros((xyz.shape[0],), dtype=xyz.dtype, device=xyz.device)
+        score = edge_scores.mean(dim=-1)
+        return torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+
+
 def _build_rotation_matrices(rotations, eps=1e-12):
     if rotations.is_cuda:
         return build_rotation(rotations).to(dtype=rotations.dtype, device=rotations.device)

@@ -27,6 +27,22 @@ def requires_value_features(mode):
     return mode in ("value_global", "value_rerank", "value_demand_rerank")
 
 
+def resolve_value_timing_selection_mode(mode, iteration=None, start_iter=0, end_iter=None):
+    selection_mode = resolve_proximity_selection_mode(mode, False)
+    start_iter = int(start_iter)
+    end_iter = int(end_iter) if end_iter is not None else None
+    if end_iter is not None and start_iter > end_iter:
+        raise ValueError("value_rerank_start_iter must be <= value_rerank_end_iter")
+    if selection_mode != "value_demand_rerank":
+        return selection_mode, False
+    if iteration is None:
+        return selection_mode, True
+    iteration = int(iteration)
+    active = iteration >= start_iter and (end_iter is None or iteration <= end_iter)
+    effective_mode = selection_mode if active else "proximity_topk"
+    return effective_mode, active
+
+
 @dataclass
 class ProximityBudgetStats:
     current: int
@@ -79,6 +95,10 @@ class ProximityBudgetStats:
     replay_active: bool = False
     replay_scheduled_src: int = 0
     replay_exact_match: bool = False
+    requested_mode: str = "original"
+    value_timing_active: bool = False
+    value_rerank_start_iter: int = 0
+    value_rerank_end_iter: int = None
 
 
 def parse_proximity_action_replay(spec):
@@ -275,6 +295,8 @@ def select_proximity_sources(
     candidate_keep_ratio=0.80,
     replay_schedule=None,
     iteration=None,
+    value_rerank_start_iter=0,
+    value_rerank_end_iter=None,
 ):
     candidates = int(candidate_mask.sum().item())
     replay_enabled = bool(replay_schedule)
@@ -287,6 +309,13 @@ def select_proximity_sources(
     selection_mode = resolve_proximity_selection_mode(
         mode,
         bool(enabled) or bool(candidate_capacity_enabled) or replay_enabled,
+    )
+    requested_mode = selection_mode
+    selection_mode, value_timing_active = resolve_value_timing_selection_mode(
+        selection_mode,
+        iteration=iteration,
+        start_iter=value_rerank_start_iter,
+        end_iter=value_rerank_end_iter,
     )
     if selection_mode != "original":
         if not candidate_capacity_enabled and not replay_enabled:
@@ -327,6 +356,10 @@ def select_proximity_sources(
             enabled=enabled,
         )
     stats.mode = selection_mode
+    stats.requested_mode = requested_mode
+    stats.value_timing_active = value_timing_active
+    stats.value_rerank_start_iter = int(value_rerank_start_iter)
+    stats.value_rerank_end_iter = int(value_rerank_end_iter) if value_rerank_end_iter is not None else None
 
     candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).reshape(-1)
     proximity_rank = _rank_indices(dist, candidate_indices, descending=True)
@@ -446,6 +479,16 @@ def format_proximity_replay_log(iteration, stats):
         f"retention={retention:.6f} "
         f"replay_active={stats.replay_active} "
         f"exact_match={stats.replay_exact_match}"
+    )
+
+
+def format_value_timing_log(iteration, stats):
+    return (
+        f"[ValueTiming] iter={iteration} "
+        f"active={stats.value_timing_active} "
+        f"start={stats.value_rerank_start_iter} "
+        f"end={stats.value_rerank_end_iter} "
+        f"effective_mode={stats.mode}"
     )
 
 
