@@ -10,6 +10,7 @@
 #
 import matplotlib.pyplot as plt
 import csv
+import inspect
 import json
 import torch
 import numpy as np
@@ -85,17 +86,29 @@ from utils.value_diagnostics import (
 from torch.optim.lr_scheduler import MultiStepLR
 
 
-RGG_BIRTH_TYPE_ROOT = 0
+RGG_BIRTH_TYPE_LEGACY = 0
+RGG_BIRTH_TYPE_ROOT = RGG_BIRTH_TYPE_LEGACY
 RGG_BIRTH_TYPE_CLONE = 1
 RGG_BIRTH_TYPE_SPLIT = 2
-RGG_BIRTH_TYPE_PROXIMITY = 3
+RGG_BIRTH_TYPE_PROXIMITY_CHILD = 3
+RGG_BIRTH_TYPE_PROXIMITY = RGG_BIRTH_TYPE_PROXIMITY_CHILD
 RGG_BIRTH_TYPE_NAMES = {
-    RGG_BIRTH_TYPE_ROOT: "root",
+    RGG_BIRTH_TYPE_LEGACY: "legacy",
     RGG_BIRTH_TYPE_CLONE: "clone",
     RGG_BIRTH_TYPE_SPLIT: "split",
-    RGG_BIRTH_TYPE_PROXIMITY: "proximity",
+    RGG_BIRTH_TYPE_PROXIMITY_CHILD: "proximity_child",
 }
 RGG_BIRTH_TYPE_BY_NAME = {name: value for value, name in RGG_BIRTH_TYPE_NAMES.items()}
+RGG_BIRTH_TYPE_BY_NAME.update(
+    {
+        "root": RGG_BIRTH_TYPE_LEGACY,
+        "LEGACY": RGG_BIRTH_TYPE_LEGACY,
+        "CLONE": RGG_BIRTH_TYPE_CLONE,
+        "SPLIT": RGG_BIRTH_TYPE_SPLIT,
+        "proximity": RGG_BIRTH_TYPE_PROXIMITY_CHILD,
+        "PROXIMITY_CHILD": RGG_BIRTH_TYPE_PROXIMITY_CHILD,
+    }
+)
 RGG_H1_SNAPSHOT_AGES = (50, 100, 200)
 RGG_H1_FUTURE_SNAPSHOT_AGES = (350, 550)
 RGG_H1_ALL_SNAPSHOT_AGES = RGG_H1_SNAPSHOT_AGES + RGG_H1_FUTURE_SNAPSHOT_AGES
@@ -153,7 +166,16 @@ class GaussianModel:
         self.rgg_generation = torch.empty(0, dtype=torch.long)
         self.rgg_birth_type = torch.empty(0, dtype=torch.long)
         self.rgg_next_uid = 0
+        self.rgg_lineage_registry = {}
         self.rgg_h1_registry = {}
+
+    @property
+    def rgg_origin_type(self):
+        return self.rgg_birth_type
+
+    @rgg_origin_type.setter
+    def rgg_origin_type(self, value):
+        self.rgg_birth_type = value
 
     def capture(self):
         return (
@@ -170,11 +192,15 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self._capture_visibility_state(),
+            self.capture_rgg_state(),
         )
 
     def restore(self, model_args, training_args, restore_optimizer=False):
         visibility_state = None
-        if len(model_args) == 13:
+        rgg_state = None
+        if len(model_args) == 14:
+            (*model_args, visibility_state, rgg_state) = model_args
+        elif len(model_args) == 13:
             (*model_args, visibility_state) = model_args
         (self.active_sh_degree,
          self._xyz,
@@ -192,7 +218,7 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self._restore_visibility_state(visibility_state)
-        self._ensure_rgg_state(birth_iter=-1)
+        self.restore_rgg_state(rgg_state)
         if restore_optimizer:
             self.optimizer.load_state_dict(opt_dict)
 
@@ -376,6 +402,9 @@ class GaussianModel:
             self.recent_visible_view_count = self.recent_visible_view_count[valid_points_mask]
 
     def _rgg_is_enabled(self):
+        return True
+
+    def _rgg_h1_is_enabled(self):
         return bool(getattr(self, "rgg_enabled", False) or getattr(self.args, "enable_rgg_diagnostics", False))
 
     def _empty_rgg_tensor(self, device=None):
@@ -391,11 +420,10 @@ class GaussianModel:
         self.rgg_generation = self._empty_rgg_tensor(device)
         self.rgg_birth_type = self._empty_rgg_tensor(device)
         self.rgg_next_uid = 0
+        self.rgg_lineage_registry = {}
         self.rgg_h1_registry = {}
 
     def _initialize_rgg_roots(self, birth_iter=0):
-        if not self._rgg_is_enabled():
-            return
         count = self.get_xyz.shape[0]
         device = self.get_xyz.device
         self.rgg_uid = torch.arange(count, dtype=torch.long, device=device)
@@ -403,14 +431,12 @@ class GaussianModel:
         self.rgg_source_uid = torch.full((count,), -1, dtype=torch.long, device=device)
         self.rgg_target_uid = torch.full((count,), -1, dtype=torch.long, device=device)
         self.rgg_generation = torch.zeros((count,), dtype=torch.long, device=device)
-        self.rgg_birth_type = torch.full((count,), RGG_BIRTH_TYPE_ROOT, dtype=torch.long, device=device)
+        self.rgg_birth_type = torch.full((count,), RGG_BIRTH_TYPE_LEGACY, dtype=torch.long, device=device)
         self.rgg_next_uid = int(count)
+        self.rgg_lineage_registry = {}
         self.rgg_h1_registry = {}
 
     def _ensure_rgg_state(self, birth_iter=-1):
-        if not self._rgg_is_enabled():
-            self._set_empty_rgg_state()
-            return
         count = self.get_xyz.shape[0]
         device = self.get_xyz.device
         fields = (
@@ -432,6 +458,8 @@ class GaussianModel:
         self.rgg_birth_type = self.rgg_birth_type.to(device=device, dtype=torch.long)
         used_next = int(self.rgg_uid.max().item()) + 1 if count else 0
         self.rgg_next_uid = max(int(getattr(self, "rgg_next_uid", 0)), used_next)
+        if not isinstance(getattr(self, "rgg_lineage_registry", None), dict):
+            self.rgg_lineage_registry = {}
 
     def _allocate_rgg_uids(self, count, device):
         start = int(getattr(self, "rgg_next_uid", 0))
@@ -440,8 +468,6 @@ class GaussianModel:
         return uids
 
     def _build_rgg_children_from_indices(self, source_indices, target_indices=None, birth_iter=0, birth_type="clone"):
-        if not self._rgg_is_enabled():
-            return None
         self._ensure_rgg_state()
         device = self.get_xyz.device
         source_indices = source_indices.reshape(-1).to(device=device, dtype=torch.long)
@@ -469,10 +495,9 @@ class GaussianModel:
         }
 
     def _append_rgg_metadata(self, child_metadata):
-        if not self._rgg_is_enabled():
-            return
         if child_metadata is None:
-            raise ValueError("RGG metadata is required when RGG diagnostics are enabled.")
+            self._ensure_rgg_state()
+            return
         expected = child_metadata["uid"].shape[0]
         if self.rgg_uid.shape[0] + expected != self.get_xyz.shape[0]:
             raise ValueError("RGG parent and child metadata counts must match Gaussian count.")
@@ -484,13 +509,14 @@ class GaussianModel:
         self.rgg_target_uid = torch.cat((self.rgg_target_uid, child_metadata["target_uid"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
         self.rgg_generation = torch.cat((self.rgg_generation, child_metadata["generation"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
         self.rgg_birth_type = torch.cat((self.rgg_birth_type, child_metadata["birth_type"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
+        self._register_rgg_lineage_children(child_metadata)
         self._register_rgg_h1_births(child_metadata)
         self._assert_rgg_aligned()
 
     def _prune_rgg_metadata(self, valid_points_mask):
-        if not self._rgg_is_enabled():
-            return
         valid_points_mask = valid_points_mask.to(device=self.rgg_uid.device, dtype=torch.bool)
+        if valid_points_mask.shape[0] != self.rgg_uid.shape[0]:
+            raise ValueError("RGG prune mask length must match metadata count.")
         self.rgg_uid = self.rgg_uid[valid_points_mask]
         self.rgg_birth_iter = self.rgg_birth_iter[valid_points_mask]
         self.rgg_source_uid = self.rgg_source_uid[valid_points_mask]
@@ -500,8 +526,6 @@ class GaussianModel:
         self._assert_rgg_aligned()
 
     def _assert_rgg_aligned(self):
-        if not self._rgg_is_enabled():
-            return
         count = self.get_xyz.shape[0]
         for field_name in ("rgg_uid", "rgg_birth_iter", "rgg_source_uid", "rgg_target_uid", "rgg_generation", "rgg_birth_type"):
             field = getattr(self, field_name)
@@ -521,6 +545,37 @@ class GaussianModel:
     def _rgg_birth_type_name(self, birth_type):
         return RGG_BIRTH_TYPE_NAMES.get(int(birth_type), "unknown")
 
+    def _rgg_h1_birth_type_name(self, birth_type):
+        if int(birth_type) == RGG_BIRTH_TYPE_LEGACY:
+            return "root"
+        if int(birth_type) == RGG_BIRTH_TYPE_PROXIMITY_CHILD:
+            return "proximity"
+        return self._rgg_birth_type_name(birth_type)
+
+    def _register_rgg_lineage_children(self, child_metadata):
+        registry = getattr(self, "rgg_lineage_registry", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            self.rgg_lineage_registry = registry
+        source_uids = child_metadata["source_uid"].detach().cpu().tolist()
+        child_uids = child_metadata["uid"].detach().cpu().tolist()
+        for source_uid, child_uid in zip(source_uids, child_uids):
+            source_uid = int(source_uid)
+            if source_uid < 0:
+                continue
+            registry.setdefault(source_uid, []).append(int(child_uid))
+
+    def _rebuild_rgg_lineage_registry_from_live_metadata(self):
+        registry = {}
+        if not torch.is_tensor(getattr(self, "rgg_source_uid", None)):
+            return registry
+        for source_uid, child_uid in zip(self.rgg_source_uid.detach().cpu().tolist(), self.rgg_uid.detach().cpu().tolist()):
+            source_uid = int(source_uid)
+            if source_uid < 0:
+                continue
+            registry.setdefault(source_uid, []).append(int(child_uid))
+        return registry
+
     def _new_rgg_h1_record(self, uid, birth_iter, source_uid, target_uid, generation, birth_type, birth_opacity=None):
         return {
             "uid": int(uid),
@@ -528,7 +583,7 @@ class GaussianModel:
             "source_uid": int(source_uid),
             "target_uid": int(target_uid),
             "generation": int(generation),
-            "birth_type": self._rgg_birth_type_name(birth_type),
+            "birth_type": self._rgg_h1_birth_type_name(birth_type),
             "birth_opacity": float(birth_opacity) if birth_opacity is not None else None,
             "death_iter": None,
             "death_reason": None,
@@ -541,7 +596,7 @@ class GaussianModel:
         }
 
     def _register_rgg_h1_births(self, child_metadata):
-        if not self._rgg_is_enabled():
+        if not self._rgg_h1_is_enabled():
             return
         birth_types_cpu = child_metadata["birth_type"].detach().cpu()
         proximity_mask_cpu = birth_types_cpu == RGG_BIRTH_TYPE_PROXIMITY
@@ -583,7 +638,7 @@ class GaussianModel:
             )
 
     def _update_rgg_h1_real_evidence(self, view_id, visible_mask, iteration=None, is_real_view=True):
-        if not self._rgg_is_enabled() or not is_real_view:
+        if not self._rgg_h1_is_enabled() or not is_real_view:
             return
         if not getattr(self, "rgg_h1_registry", None):
             return
@@ -635,7 +690,7 @@ class GaussianModel:
         return float(record["postbirth_real_visible_events"]) / float(opportunities)
 
     def _finalize_rgg_h1_pruned(self, pruned_mask, death_iter, death_reason):
-        if not self._rgg_is_enabled() or not getattr(self, "rgg_h1_registry", None):
+        if not self._rgg_h1_is_enabled() or not getattr(self, "rgg_h1_registry", None):
             return
         pruned_mask = pruned_mask.reshape(-1).to(device=self.rgg_uid.device, dtype=torch.bool)
         if pruned_mask.shape[0] != self.rgg_uid.shape[0]:
@@ -702,7 +757,7 @@ class GaussianModel:
         return summary
 
     def save_rgg_diagnostics(self, directory, observation_end_iter=None):
-        if not self._rgg_is_enabled():
+        if not self._rgg_h1_is_enabled():
             return
         mkdir_p(directory)
         records = self.get_rgg_h1_records(observation_end_iter=observation_end_iter)
@@ -780,8 +835,6 @@ class GaussianModel:
                 writer.writerow(row)
 
     def capture_rgg_state(self):
-        if not self._rgg_is_enabled():
-            return None
         self._ensure_rgg_state()
         return {
             "enabled": True,
@@ -791,14 +844,16 @@ class GaussianModel:
             "target_uid": self.rgg_target_uid.detach().cpu(),
             "generation": self.rgg_generation.detach().cpu(),
             "birth_type": self.rgg_birth_type.detach().cpu(),
+            "origin_type": self.rgg_birth_type.detach().cpu(),
             "next_uid": int(self.rgg_next_uid),
+            "source_children": {
+                int(source_uid): [int(child_uid) for child_uid in child_uids]
+                for source_uid, child_uids in getattr(self, "rgg_lineage_registry", {}).items()
+            },
             "h1_registry": self.get_rgg_h1_records(),
         }
 
     def restore_rgg_state(self, state):
-        if not self._rgg_is_enabled():
-            self._set_empty_rgg_state()
-            return
         if state is None:
             self._initialize_rgg_roots(birth_iter=-1)
             return
@@ -815,8 +870,8 @@ class GaussianModel:
         self.rgg_source_uid = state["source_uid"].to(device=device, dtype=torch.long)
         self.rgg_target_uid = state["target_uid"].to(device=device, dtype=torch.long)
         self.rgg_generation = state["generation"].to(device=device, dtype=torch.long)
-        if "birth_type" in state:
-            birth_type = state["birth_type"]
+        if "birth_type" in state or "origin_type" in state:
+            birth_type = state["birth_type"] if "birth_type" in state else state["origin_type"]
             if not torch.is_tensor(birth_type) or birth_type.shape[0] != expected_count:
                 raise ValueError("paired fork checkpoint RGG birth_type first dimension must match Gaussian count.")
             self.rgg_birth_type = birth_type.to(device=device, dtype=torch.long)
@@ -824,8 +879,23 @@ class GaussianModel:
             self.rgg_birth_type = torch.full((expected_count,), RGG_BIRTH_TYPE_ROOT, dtype=torch.long, device=device)
         used_next = int(self.rgg_uid.max().item()) + 1 if expected_count else 0
         self.rgg_next_uid = max(int(state.get("next_uid", 0)), used_next)
+        self.rgg_lineage_registry = self._restore_rgg_lineage_registry(state.get("source_children"))
+        if not self.rgg_lineage_registry:
+            self.rgg_lineage_registry = self._rebuild_rgg_lineage_registry_from_live_metadata()
         self.rgg_h1_registry = self._restore_rgg_h1_registry(state.get("h1_registry", []))
         self._assert_rgg_aligned()
+
+    def _restore_rgg_lineage_registry(self, source_children):
+        if source_children is None:
+            return {}
+        if not isinstance(source_children, dict):
+            raise ValueError("paired fork checkpoint RGG source_children registry must be a dict.")
+        registry = {}
+        for source_uid, child_uids in source_children.items():
+            if not isinstance(child_uids, (list, tuple)):
+                raise ValueError("paired fork checkpoint RGG source_children values must be lists.")
+            registry[int(source_uid)] = [int(child_uid) for child_uid in child_uids]
+        return registry
 
     def _restore_rgg_h1_registry(self, records):
         registry = {}
@@ -1094,6 +1164,7 @@ class GaussianModel:
     def dist_prune(self):
         dist = chamfer_dist(self.init_point, self._xyz)
         valid_points_mask = (dist < 3.0)
+        self._ensure_rgg_state()
         self._finalize_rgg_h1_pruned(~valid_points_mask, death_iter=-1, death_reason="dist_prune")
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -1113,6 +1184,7 @@ class GaussianModel:
     def prune_points(self, mask, iter, rgg_death_reason="training_prune"):
         if iter > self.args.prune_from_iter:
             valid_points_mask = ~mask
+            self._ensure_rgg_state()
             self._finalize_rgg_h1_pruned(mask, death_iter=iter, death_reason=rgg_death_reason)
             optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -1183,6 +1255,36 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=device)
         self.confidence = torch.cat([self.confidence, torch.ones(new_opacities.shape, device=device)], 0)
         self._append_rgg_metadata(rgg_child_metadata)
+
+    def _call_densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
+                                    new_rotation, rgg_child_metadata):
+        try:
+            signature = inspect.signature(self.densification_postfix)
+            accepts_metadata = (
+                "rgg_child_metadata" in signature.parameters
+                or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+            )
+        except (TypeError, ValueError):
+            accepts_metadata = True
+        if accepts_metadata:
+            self.densification_postfix(
+                new_xyz,
+                new_features_dc,
+                new_features_rest,
+                new_opacities,
+                new_scaling,
+                new_rotation,
+                rgg_child_metadata=rgg_child_metadata,
+            )
+        else:
+            self.densification_postfix(
+                new_xyz,
+                new_features_dc,
+                new_features_rest,
+                new_opacities,
+                new_scaling,
+                new_rotation,
+            )
 
 
     def compute_fsgs_proximity_candidate_value(
@@ -1613,18 +1715,16 @@ class GaussianModel:
             )
 
         new_indices = target_indices.reshape(-1).long()
-        rgg_child_metadata = None
-        if self._rgg_is_enabled():
-            source_indices = selected_pts_mask.nonzero(as_tuple=False).reshape(-1).long()
-            rgg_source_indices = source_indices[:, None].repeat(1, N).reshape(-1)
-            if rgg_source_indices.numel() != new_indices.numel():
-                raise ValueError("RGG proximity source/target metadata count mismatch.")
-            rgg_child_metadata = self._build_rgg_children_from_indices(
-                rgg_source_indices,
-                target_indices=new_indices,
-                birth_iter=iteration if iteration is not None else 0,
-                birth_type="proximity",
-            )
+        source_indices = selected_pts_mask.nonzero(as_tuple=False).reshape(-1).long()
+        rgg_source_indices = source_indices[:, None].repeat(1, N).reshape(-1)
+        if rgg_source_indices.numel() != new_indices.numel():
+            raise ValueError("RGG proximity source/target metadata count mismatch.")
+        rgg_child_metadata = self._build_rgg_children_from_indices(
+            rgg_source_indices,
+            target_indices=new_indices,
+            birth_iter=iteration if iteration is not None else 0,
+            birth_type="proximity_child",
+        )
         source_xyz = self._xyz[selected_pts_mask][:, None, :].repeat(1, N, 1).reshape(-1, 3)
         target_xyz = self._xyz[new_indices]
         new_xyz = (source_xyz + target_xyz) / 2
@@ -1634,25 +1734,15 @@ class GaussianModel:
         new_features_dc = torch.zeros_like(self._features_dc[new_indices])
         new_features_rest = torch.zeros_like(self._features_rest[new_indices])
         new_opacity = self._opacity[new_indices]
-        if self._rgg_is_enabled():
-            self.densification_postfix(
-                new_xyz,
-                new_features_dc,
-                new_features_rest,
-                new_opacity,
-                new_scaling,
-                new_rotation,
-                rgg_child_metadata=rgg_child_metadata,
-            )
-        else:
-            self.densification_postfix(
-                new_xyz,
-                new_features_dc,
-                new_features_rest,
-                new_opacity,
-                new_scaling,
-                new_rotation,
-            )
+        self._call_densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            rgg_child_metadata,
+        )
         self._append_visibility_from_masks(selected_pts_mask, repeat_count=N, target_indices=new_indices)
         return proximity_sources, proximity_proposed, budget_stats.selected_src, budget_stats.selected_new
 
@@ -1687,31 +1777,21 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
-        if self._rgg_is_enabled():
-            source_indices = selected_pts_mask.nonzero(as_tuple=False).reshape(-1).long().repeat(N)
-            rgg_child_metadata = self._build_rgg_children_from_indices(
-                source_indices,
-                birth_iter=iter,
-                birth_type="split",
-            )
-            self.densification_postfix(
-                new_xyz,
-                new_features_dc,
-                new_features_rest,
-                new_opacity,
-                new_scaling,
-                new_rotation,
-                rgg_child_metadata=rgg_child_metadata,
-            )
-        else:
-            self.densification_postfix(
-                new_xyz,
-                new_features_dc,
-                new_features_rest,
-                new_opacity,
-                new_scaling,
-                new_rotation,
-            )
+        source_indices = selected_pts_mask.nonzero(as_tuple=False).reshape(-1).long().repeat(N)
+        rgg_child_metadata = self._build_rgg_children_from_indices(
+            source_indices,
+            birth_iter=iter,
+            birth_type="split",
+        )
+        self._call_densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            rgg_child_metadata,
+        )
         self._append_visibility_from_masks(selected_pts_mask, repeat_count=N)
 
         prune_filter = torch.cat(
@@ -1734,18 +1814,21 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-        if self._rgg_is_enabled():
-            source_indices = selected_pts_mask.nonzero(as_tuple=False).reshape(-1).long()
-            rgg_child_metadata = self._build_rgg_children_from_indices(
-                source_indices,
-                birth_iter=iter if iter is not None else 0,
-                birth_type="clone",
-            )
-            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                       new_rotation, rgg_child_metadata=rgg_child_metadata)
-        else:
-            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                       new_rotation)
+        source_indices = selected_pts_mask.nonzero(as_tuple=False).reshape(-1).long()
+        rgg_child_metadata = self._build_rgg_children_from_indices(
+            source_indices,
+            birth_iter=iter if iter is not None else 0,
+            birth_type="clone",
+        )
+        self._call_densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            rgg_child_metadata,
+        )
         self._append_visibility_from_masks(selected_pts_mask)
         return clone_candidates
 

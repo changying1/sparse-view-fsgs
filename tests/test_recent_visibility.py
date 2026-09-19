@@ -141,9 +141,12 @@ def test_capture_restore_does_not_checkpoint_recent_state(monkeypatch):
 
     captured = model.capture()
 
-    assert len(captured) == 13
-    assert "recent_visibility_history" not in captured[-1]
-    assert "recent_visible_view_count" not in captured[-1]
+    assert len(captured) == 14
+    visibility_state = captured[-2]
+    rgg_state = captured[-1]
+    assert "recent_visibility_history" not in visibility_state
+    assert "recent_visible_view_count" not in visibility_state
+    assert rgg_state["uid"].tolist() == [0, 1]
 
 
 def test_obdkr_training_semantics_ignore_recent_counts():

@@ -571,7 +571,8 @@ def test_rgg_disabled_does_not_change_clone_growth_or_rng(monkeypatch):
 
     assert candidates == 2
     assert model.get_xyz.shape[0] == 5
-    assert model.rgg_uid.numel() == 0
+    _assert_aligned(model)
+    assert model.rgg_uid.tolist() == [0, 1, 2, 3, 4]
     assert before_py == after_py
     assert all(np.array_equal(left, right) if isinstance(left, np.ndarray) else left == right for left, right in zip(before_np, after_np))
     assert torch.equal(before_torch, after_torch)
@@ -597,11 +598,8 @@ def test_rgg_disabled_does_not_change_split_growth_or_rng(monkeypatch):
 
     assert split_stats == (1, 0, 1)
     assert model.get_xyz.shape[0] == 4
-    assert model.rgg_uid.numel() == 0
-    assert model.rgg_birth_iter.numel() == 0
-    assert model.rgg_source_uid.numel() == 0
-    assert model.rgg_target_uid.numel() == 0
-    assert model.rgg_generation.numel() == 0
+    _assert_aligned(model)
+    assert model.rgg_uid.tolist() == [1, 2, 3, 4]
     assert before_py == after_py
     assert all(np.array_equal(left, right) if isinstance(left, np.ndarray) else left == right for left, right in zip(before_np, after_np))
     assert torch.equal(before_torch, after_torch)
@@ -628,11 +626,8 @@ def test_rgg_disabled_does_not_change_proximity_growth_or_rng(monkeypatch):
 
     assert result == (1, 1, 1, 1)
     assert model.get_xyz.shape[0] == 4
-    assert model.rgg_uid.numel() == 0
-    assert model.rgg_birth_iter.numel() == 0
-    assert model.rgg_source_uid.numel() == 0
-    assert model.rgg_target_uid.numel() == 0
-    assert model.rgg_generation.numel() == 0
+    _assert_aligned(model)
+    assert model.rgg_uid.tolist() == [0, 1, 2, 3]
     assert before_py == after_py
     assert all(np.array_equal(left, right) if isinstance(left, np.ndarray) else left == right for left, right in zip(before_np, after_np))
     assert torch.equal(before_torch, after_torch)
