@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 import matplotlib.pyplot as plt
+import csv
+import json
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
@@ -83,6 +85,22 @@ from utils.value_diagnostics import (
 from torch.optim.lr_scheduler import MultiStepLR
 
 
+RGG_BIRTH_TYPE_ROOT = 0
+RGG_BIRTH_TYPE_CLONE = 1
+RGG_BIRTH_TYPE_SPLIT = 2
+RGG_BIRTH_TYPE_PROXIMITY = 3
+RGG_BIRTH_TYPE_NAMES = {
+    RGG_BIRTH_TYPE_ROOT: "root",
+    RGG_BIRTH_TYPE_CLONE: "clone",
+    RGG_BIRTH_TYPE_SPLIT: "split",
+    RGG_BIRTH_TYPE_PROXIMITY: "proximity",
+}
+RGG_BIRTH_TYPE_BY_NAME = {name: value for value, name in RGG_BIRTH_TYPE_NAMES.items()}
+RGG_H1_SNAPSHOT_AGES = (50, 100, 200)
+RGG_H1_FUTURE_SNAPSHOT_AGES = (350, 550)
+RGG_H1_ALL_SNAPSHOT_AGES = RGG_H1_SNAPSHOT_AGES + RGG_H1_FUTURE_SNAPSHOT_AGES
+
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -133,7 +151,9 @@ class GaussianModel:
         self.rgg_source_uid = torch.empty(0, dtype=torch.long)
         self.rgg_target_uid = torch.empty(0, dtype=torch.long)
         self.rgg_generation = torch.empty(0, dtype=torch.long)
+        self.rgg_birth_type = torch.empty(0, dtype=torch.long)
         self.rgg_next_uid = 0
+        self.rgg_h1_registry = {}
 
     def capture(self):
         return (
@@ -215,7 +235,7 @@ class GaussianModel:
             self.visible_view_count = self.visible_view_count.to(device=device, dtype=torch.long)
         self._ensure_recent_visibility_history(num_views)
 
-    def update_visibility(self, view_id, visible_mask):
+    def update_visibility(self, view_id, visible_mask, iteration=None, is_real_view=True):
         view_id = int(view_id)
         if self.visibility_history is None:
             self.ensure_visibility_history(view_id + 1)
@@ -232,6 +252,7 @@ class GaussianModel:
         else:
             self.visible_view_count += newly_visible.to(dtype=self.visible_view_count.dtype)
         self._update_recent_visibility(view_id, mask)
+        self._update_rgg_h1_real_evidence(view_id, mask, iteration=iteration, is_real_view=is_real_view)
 
     def _sync_visibility_shape(self, rebuild_missing=False):
         count = self.get_xyz.shape[0]
@@ -368,7 +389,9 @@ class GaussianModel:
         self.rgg_source_uid = self._empty_rgg_tensor(device)
         self.rgg_target_uid = self._empty_rgg_tensor(device)
         self.rgg_generation = self._empty_rgg_tensor(device)
+        self.rgg_birth_type = self._empty_rgg_tensor(device)
         self.rgg_next_uid = 0
+        self.rgg_h1_registry = {}
 
     def _initialize_rgg_roots(self, birth_iter=0):
         if not self._rgg_is_enabled():
@@ -380,7 +403,9 @@ class GaussianModel:
         self.rgg_source_uid = torch.full((count,), -1, dtype=torch.long, device=device)
         self.rgg_target_uid = torch.full((count,), -1, dtype=torch.long, device=device)
         self.rgg_generation = torch.zeros((count,), dtype=torch.long, device=device)
+        self.rgg_birth_type = torch.full((count,), RGG_BIRTH_TYPE_ROOT, dtype=torch.long, device=device)
         self.rgg_next_uid = int(count)
+        self.rgg_h1_registry = {}
 
     def _ensure_rgg_state(self, birth_iter=-1):
         if not self._rgg_is_enabled():
@@ -394,6 +419,7 @@ class GaussianModel:
             getattr(self, "rgg_source_uid", None),
             getattr(self, "rgg_target_uid", None),
             getattr(self, "rgg_generation", None),
+            getattr(self, "rgg_birth_type", None),
         )
         if any((not torch.is_tensor(field)) or field.shape[0] != count for field in fields):
             self._initialize_rgg_roots(birth_iter=birth_iter)
@@ -403,6 +429,7 @@ class GaussianModel:
         self.rgg_source_uid = self.rgg_source_uid.to(device=device, dtype=torch.long)
         self.rgg_target_uid = self.rgg_target_uid.to(device=device, dtype=torch.long)
         self.rgg_generation = self.rgg_generation.to(device=device, dtype=torch.long)
+        self.rgg_birth_type = self.rgg_birth_type.to(device=device, dtype=torch.long)
         used_next = int(self.rgg_uid.max().item()) + 1 if count else 0
         self.rgg_next_uid = max(int(getattr(self, "rgg_next_uid", 0)), used_next)
 
@@ -412,13 +439,14 @@ class GaussianModel:
         self.rgg_next_uid = start + int(count)
         return uids
 
-    def _build_rgg_children_from_indices(self, source_indices, target_indices=None, birth_iter=0):
+    def _build_rgg_children_from_indices(self, source_indices, target_indices=None, birth_iter=0, birth_type="clone"):
         if not self._rgg_is_enabled():
             return None
         self._ensure_rgg_state()
         device = self.get_xyz.device
         source_indices = source_indices.reshape(-1).to(device=device, dtype=torch.long)
         child_count = source_indices.shape[0]
+        birth_type_value = self._rgg_birth_type_value(birth_type)
         source_uid = self.rgg_uid[source_indices]
         source_generation = self.rgg_generation[source_indices]
         if target_indices is None:
@@ -437,6 +465,7 @@ class GaussianModel:
             "source_uid": source_uid.clone(),
             "target_uid": target_uid.clone(),
             "generation": generation.clone(),
+            "birth_type": torch.full((child_count,), birth_type_value, dtype=torch.long, device=device),
         }
 
     def _append_rgg_metadata(self, child_metadata):
@@ -454,6 +483,8 @@ class GaussianModel:
         self.rgg_source_uid = torch.cat((self.rgg_source_uid, child_metadata["source_uid"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
         self.rgg_target_uid = torch.cat((self.rgg_target_uid, child_metadata["target_uid"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
         self.rgg_generation = torch.cat((self.rgg_generation, child_metadata["generation"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
+        self.rgg_birth_type = torch.cat((self.rgg_birth_type, child_metadata["birth_type"].to(self.get_xyz.device, dtype=torch.long)), dim=0)
+        self._register_rgg_h1_births(child_metadata)
         self._assert_rgg_aligned()
 
     def _prune_rgg_metadata(self, valid_points_mask):
@@ -465,16 +496,288 @@ class GaussianModel:
         self.rgg_source_uid = self.rgg_source_uid[valid_points_mask]
         self.rgg_target_uid = self.rgg_target_uid[valid_points_mask]
         self.rgg_generation = self.rgg_generation[valid_points_mask]
+        self.rgg_birth_type = self.rgg_birth_type[valid_points_mask]
         self._assert_rgg_aligned()
 
     def _assert_rgg_aligned(self):
         if not self._rgg_is_enabled():
             return
         count = self.get_xyz.shape[0]
-        for field_name in ("rgg_uid", "rgg_birth_iter", "rgg_source_uid", "rgg_target_uid", "rgg_generation"):
+        for field_name in ("rgg_uid", "rgg_birth_iter", "rgg_source_uid", "rgg_target_uid", "rgg_generation", "rgg_birth_type"):
             field = getattr(self, field_name)
             if field.shape[0] != count:
                 raise ValueError(f"{field_name} first dimension must match Gaussian count.")
+
+    def _rgg_birth_type_value(self, birth_type):
+        if isinstance(birth_type, str):
+            if birth_type not in RGG_BIRTH_TYPE_BY_NAME:
+                raise ValueError("unknown RGG birth type.")
+            return RGG_BIRTH_TYPE_BY_NAME[birth_type]
+        birth_type = int(birth_type)
+        if birth_type not in RGG_BIRTH_TYPE_NAMES:
+            raise ValueError("unknown RGG birth type.")
+        return birth_type
+
+    def _rgg_birth_type_name(self, birth_type):
+        return RGG_BIRTH_TYPE_NAMES.get(int(birth_type), "unknown")
+
+    def _new_rgg_h1_record(self, uid, birth_iter, source_uid, target_uid, generation, birth_type, birth_opacity=None):
+        return {
+            "uid": int(uid),
+            "birth_iter": int(birth_iter),
+            "source_uid": int(source_uid),
+            "target_uid": int(target_uid),
+            "generation": int(generation),
+            "birth_type": self._rgg_birth_type_name(birth_type),
+            "birth_opacity": float(birth_opacity) if birth_opacity is not None else None,
+            "death_iter": None,
+            "death_reason": None,
+            "alive": True,
+            "postbirth_real_opportunities": 0,
+            "postbirth_real_visible_events": 0,
+            "postbirth_unique_real_views": 0,
+            "postbirth_real_view_ids": set(),
+            "age_snapshots": {},
+        }
+
+    def _register_rgg_h1_births(self, child_metadata):
+        if not self._rgg_is_enabled():
+            return
+        birth_types_cpu = child_metadata["birth_type"].detach().cpu()
+        proximity_mask_cpu = birth_types_cpu == RGG_BIRTH_TYPE_PROXIMITY
+        if not bool(proximity_mask_cpu.any().item()):
+            return
+        uids = child_metadata["uid"].detach().cpu()[proximity_mask_cpu].tolist()
+        birth_iters = child_metadata["birth_iter"].detach().cpu()[proximity_mask_cpu].tolist()
+        source_uids = child_metadata["source_uid"].detach().cpu()[proximity_mask_cpu].tolist()
+        target_uids = child_metadata["target_uid"].detach().cpu()[proximity_mask_cpu].tolist()
+        generations = child_metadata["generation"].detach().cpu()[proximity_mask_cpu].tolist()
+        birth_types = birth_types_cpu[proximity_mask_cpu].tolist()
+        child_count = int(birth_types_cpu.shape[0])
+        opacity_count = int(self.get_opacity.shape[0])
+        birth_opacities = [None] * len(uids)
+        if child_count <= opacity_count:
+            child_opacities_cpu = self.get_opacity[-child_count:].detach().reshape(-1).cpu()
+            birth_opacities = child_opacities_cpu[proximity_mask_cpu].tolist()
+        for uid, birth_iter, source_uid, target_uid, generation, birth_type_value, birth_opacity in zip(
+            uids,
+            birth_iters,
+            source_uids,
+            target_uids,
+            generations,
+            birth_types,
+            birth_opacities,
+        ):
+            uid = int(uid)
+            birth_iter = int(birth_iter)
+            if birth_iter < 0:
+                continue
+            self.rgg_h1_registry[uid] = self._new_rgg_h1_record(
+                uid,
+                birth_iter,
+                int(source_uid),
+                int(target_uid),
+                int(generation),
+                birth_type_value,
+                birth_opacity=birth_opacity,
+            )
+
+    def _update_rgg_h1_real_evidence(self, view_id, visible_mask, iteration=None, is_real_view=True):
+        if not self._rgg_is_enabled() or not is_real_view:
+            return
+        if not getattr(self, "rgg_h1_registry", None):
+            return
+        self._assert_rgg_aligned()
+        mask = visible_mask.reshape(-1).detach().to(device=self.rgg_uid.device, dtype=torch.bool)
+        if mask.shape[0] != self.rgg_uid.shape[0]:
+            raise ValueError("RGG post-birth visible mask length must match current Gaussian count.")
+        active_indices = (self.rgg_birth_type == RGG_BIRTH_TYPE_PROXIMITY).nonzero(as_tuple=False).reshape(-1)
+        active_uids = self.rgg_uid[active_indices].detach().cpu().tolist()
+        active_visible = mask[active_indices].detach().cpu().tolist()
+        active_opacities = self.get_opacity[active_indices].detach().reshape(-1).cpu().tolist()
+        for uid, visible, opacity in zip(active_uids, active_visible, active_opacities):
+            uid = int(uid)
+            record = self.rgg_h1_registry.get(uid)
+            if record is None or not record["alive"]:
+                continue
+            if iteration is not None and int(iteration) <= record["birth_iter"]:
+                continue
+            record["postbirth_real_opportunities"] += 1
+            if bool(visible):
+                record["postbirth_real_visible_events"] += 1
+                record["postbirth_real_view_ids"].add(int(view_id))
+                record["postbirth_unique_real_views"] = len(record["postbirth_real_view_ids"])
+            self._maybe_record_rgg_h1_snapshots(record, iteration, opacity=opacity)
+
+    def _maybe_record_rgg_h1_snapshots(self, record, iteration, opacity=None):
+        if iteration is None:
+            return
+        age = int(iteration) - int(record["birth_iter"])
+        if age < 0:
+            return
+        for snapshot_age in RGG_H1_ALL_SNAPSHOT_AGES:
+            key = str(snapshot_age)
+            if age >= snapshot_age and key not in record["age_snapshots"]:
+                record["age_snapshots"][key] = {
+                    "iteration": int(iteration),
+                    "age": age,
+                    "postbirth_real_opportunities": int(record["postbirth_real_opportunities"]),
+                    "postbirth_real_visible_events": int(record["postbirth_real_visible_events"]),
+                    "postbirth_unique_real_views": int(record["postbirth_unique_real_views"]),
+                    "visible_rate": self._rgg_visible_rate(record),
+                    "opacity": float(opacity) if opacity is not None else None,
+                }
+
+    def _rgg_visible_rate(self, record):
+        opportunities = int(record["postbirth_real_opportunities"])
+        if opportunities == 0:
+            return 0.0
+        return float(record["postbirth_real_visible_events"]) / float(opportunities)
+
+    def _finalize_rgg_h1_pruned(self, pruned_mask, death_iter, death_reason):
+        if not self._rgg_is_enabled() or not getattr(self, "rgg_h1_registry", None):
+            return
+        pruned_mask = pruned_mask.reshape(-1).to(device=self.rgg_uid.device, dtype=torch.bool)
+        if pruned_mask.shape[0] != self.rgg_uid.shape[0]:
+            raise ValueError("RGG prune mask length must match current Gaussian count.")
+        pruned_indices = pruned_mask.nonzero(as_tuple=False).reshape(-1)
+        pruned_uids = self.rgg_uid[pruned_indices].detach().cpu().tolist()
+        for uid in pruned_uids:
+            uid = int(uid)
+            record = self.rgg_h1_registry.get(uid)
+            if record is None:
+                continue
+            record["alive"] = False
+            record["death_iter"] = int(death_iter) if death_iter is not None else -1
+            record["death_reason"] = str(death_reason)
+
+    def get_rgg_h1_records(self, observation_end_iter=None):
+        records = []
+        for uid in sorted(getattr(self, "rgg_h1_registry", {}).keys()):
+            records.append(self._serialize_rgg_h1_record(self.rgg_h1_registry[uid], observation_end_iter=observation_end_iter))
+        return records
+
+    def _serialize_rgg_h1_record(self, record, observation_end_iter=None):
+        output = dict(record)
+        output["postbirth_real_view_ids"] = sorted(int(view_id) for view_id in record["postbirth_real_view_ids"])
+        output["visible_rate"] = self._rgg_visible_rate(record)
+        output["observation_end_iter"] = int(observation_end_iter) if observation_end_iter is not None else None
+        output["age_at_export"] = None
+        if output["observation_end_iter"] is not None and int(record["birth_iter"]) >= 0:
+            output["age_at_export"] = output["observation_end_iter"] - int(record["birth_iter"])
+        death_iter = record.get("death_iter")
+        output["terminal_age"] = None
+        if death_iter is not None and int(death_iter) >= 0 and int(record["birth_iter"]) >= 0:
+            output["terminal_age"] = int(death_iter) - int(record["birth_iter"])
+        output["age_snapshots"] = {
+            str(age): dict(snapshot)
+            for age, snapshot in record["age_snapshots"].items()
+        }
+        return output
+
+    def _summarize_rgg_h1_records(self, records, observation_end_iter=None):
+        summary = {
+            "observation_end_iter": int(observation_end_iter) if observation_end_iter is not None else None,
+            "total_proximity_records": len(records),
+            "alive": 0,
+            "training_prune": 0,
+            "split_replaced": 0,
+            "dist_prune": 0,
+            "snapshot_50": 0,
+            "snapshot_100": 0,
+            "snapshot_200": 0,
+            "snapshot_350": 0,
+            "snapshot_550": 0,
+        }
+        for record in records:
+            if record.get("alive"):
+                summary["alive"] += 1
+            death_reason = record.get("death_reason")
+            if death_reason in ("training_prune", "split_replaced", "dist_prune"):
+                summary[death_reason] += 1
+            snapshots = record.get("age_snapshots", {})
+            for age in RGG_H1_ALL_SNAPSHOT_AGES:
+                if str(age) in snapshots:
+                    summary[f"snapshot_{age}"] += 1
+        return summary
+
+    def save_rgg_diagnostics(self, directory, observation_end_iter=None):
+        if not self._rgg_is_enabled():
+            return
+        mkdir_p(directory)
+        records = self.get_rgg_h1_records(observation_end_iter=observation_end_iter)
+        json_path = os.path.join(directory, "h1_proximity_postbirth_support.json")
+        csv_path = os.path.join(directory, "h1_proximity_postbirth_support.csv")
+        summary_path = os.path.join(directory, "h1_summary.json")
+        with open(json_path, "w", encoding="utf-8") as handle:
+            json.dump(records, handle, indent=2, sort_keys=True)
+        summary = self._summarize_rgg_h1_records(records, observation_end_iter=observation_end_iter)
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, sort_keys=True)
+        print(
+            "[RGGH1Summary] "
+            f"end_iter={summary['observation_end_iter']} "
+            f"total={summary['total_proximity_records']} "
+            f"alive={summary['alive']} "
+            f"training_prune={summary['training_prune']} "
+            f"split_replaced={summary['split_replaced']} "
+            f"dist_prune={summary['dist_prune']} "
+            f"snap50={summary['snapshot_50']} "
+            f"snap100={summary['snapshot_100']} "
+            f"snap200={summary['snapshot_200']} "
+            f"snap350={summary['snapshot_350']} "
+            f"snap550={summary['snapshot_550']}",
+            flush=True,
+        )
+        fieldnames = [
+            "uid",
+            "birth_iter",
+            "source_uid",
+            "target_uid",
+            "generation",
+            "birth_type",
+            "birth_opacity",
+            "death_iter",
+            "death_reason",
+            "alive",
+            "postbirth_real_opportunities",
+            "postbirth_real_visible_events",
+            "postbirth_unique_real_views",
+            "visible_rate",
+            "observation_end_iter",
+            "age_at_export",
+            "terminal_age",
+        ]
+        for age in RGG_H1_ALL_SNAPSHOT_AGES:
+            for suffix in (
+                "iteration",
+                "age",
+                "postbirth_real_opportunities",
+                "postbirth_real_visible_events",
+                "postbirth_unique_real_views",
+                "visible_rate",
+                "opacity",
+            ):
+                fieldnames.append(f"age_{age}_{suffix}")
+        with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for record in records:
+                snapshot_prefixes = tuple(f"age_{age}_" for age in RGG_H1_ALL_SNAPSHOT_AGES)
+                row = {key: record.get(key) for key in fieldnames if not key.startswith(snapshot_prefixes)}
+                for age in RGG_H1_ALL_SNAPSHOT_AGES:
+                    snapshot = record["age_snapshots"].get(str(age), {})
+                    for suffix in (
+                        "iteration",
+                        "age",
+                        "postbirth_real_opportunities",
+                        "postbirth_real_visible_events",
+                        "postbirth_unique_real_views",
+                        "visible_rate",
+                        "opacity",
+                    ):
+                        row[f"age_{age}_{suffix}"] = snapshot.get(suffix)
+                writer.writerow(row)
 
     def capture_rgg_state(self):
         if not self._rgg_is_enabled():
@@ -487,7 +790,9 @@ class GaussianModel:
             "source_uid": self.rgg_source_uid.detach().cpu(),
             "target_uid": self.rgg_target_uid.detach().cpu(),
             "generation": self.rgg_generation.detach().cpu(),
+            "birth_type": self.rgg_birth_type.detach().cpu(),
             "next_uid": int(self.rgg_next_uid),
+            "h1_registry": self.get_rgg_h1_records(),
         }
 
     def restore_rgg_state(self, state):
@@ -510,9 +815,50 @@ class GaussianModel:
         self.rgg_source_uid = state["source_uid"].to(device=device, dtype=torch.long)
         self.rgg_target_uid = state["target_uid"].to(device=device, dtype=torch.long)
         self.rgg_generation = state["generation"].to(device=device, dtype=torch.long)
+        if "birth_type" in state:
+            birth_type = state["birth_type"]
+            if not torch.is_tensor(birth_type) or birth_type.shape[0] != expected_count:
+                raise ValueError("paired fork checkpoint RGG birth_type first dimension must match Gaussian count.")
+            self.rgg_birth_type = birth_type.to(device=device, dtype=torch.long)
+        else:
+            self.rgg_birth_type = torch.full((expected_count,), RGG_BIRTH_TYPE_ROOT, dtype=torch.long, device=device)
         used_next = int(self.rgg_uid.max().item()) + 1 if expected_count else 0
         self.rgg_next_uid = max(int(state.get("next_uid", 0)), used_next)
+        self.rgg_h1_registry = self._restore_rgg_h1_registry(state.get("h1_registry", []))
         self._assert_rgg_aligned()
+
+    def _restore_rgg_h1_registry(self, records):
+        registry = {}
+        if records is None:
+            return registry
+        if not isinstance(records, list):
+            raise ValueError("paired fork checkpoint RGG H1 registry must be a list.")
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("paired fork checkpoint RGG H1 record must be a dict.")
+            uid = int(record["uid"])
+            restored = {
+                "uid": uid,
+                "birth_iter": int(record["birth_iter"]),
+                "source_uid": int(record["source_uid"]),
+                "target_uid": int(record["target_uid"]),
+                "generation": int(record["generation"]),
+                "birth_type": str(record["birth_type"]),
+                "birth_opacity": record.get("birth_opacity"),
+                "death_iter": record.get("death_iter"),
+                "death_reason": record.get("death_reason"),
+                "alive": bool(record.get("alive", True)),
+                "postbirth_real_opportunities": int(record.get("postbirth_real_opportunities", 0)),
+                "postbirth_real_visible_events": int(record.get("postbirth_real_visible_events", 0)),
+                "postbirth_unique_real_views": int(record.get("postbirth_unique_real_views", 0)),
+                "postbirth_real_view_ids": set(int(view_id) for view_id in record.get("postbirth_real_view_ids", [])),
+                "age_snapshots": {
+                    str(age): dict(snapshot)
+                    for age, snapshot in record.get("age_snapshots", {}).items()
+                },
+            }
+            registry[uid] = restored
+        return registry
 
     def _resolve_value_observation_count(self, lifetime_count, recent_count):
         observation_source = getattr(self.args, "value_observation_source", "lifetime")
@@ -748,6 +1094,7 @@ class GaussianModel:
     def dist_prune(self):
         dist = chamfer_dist(self.init_point, self._xyz)
         valid_points_mask = (dist < 3.0)
+        self._finalize_rgg_h1_pruned(~valid_points_mask, death_iter=-1, death_reason="dist_prune")
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
@@ -763,9 +1110,10 @@ class GaussianModel:
         self._prune_rgg_metadata(valid_points_mask)
 
 
-    def prune_points(self, mask, iter):
+    def prune_points(self, mask, iter, rgg_death_reason="training_prune"):
         if iter > self.args.prune_from_iter:
             valid_points_mask = ~mask
+            self._finalize_rgg_h1_pruned(mask, death_iter=iter, death_reason=rgg_death_reason)
             optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
             self._xyz = optimizable_tensors["xyz"]
@@ -1275,6 +1623,7 @@ class GaussianModel:
                 rgg_source_indices,
                 target_indices=new_indices,
                 birth_iter=iteration if iteration is not None else 0,
+                birth_type="proximity",
             )
         source_xyz = self._xyz[selected_pts_mask][:, None, :].repeat(1, N, 1).reshape(-1, 3)
         target_xyz = self._xyz[new_indices]
@@ -1340,7 +1689,11 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
         if self._rgg_is_enabled():
             source_indices = selected_pts_mask.nonzero(as_tuple=False).reshape(-1).long().repeat(N)
-            rgg_child_metadata = self._build_rgg_children_from_indices(source_indices, birth_iter=iter)
+            rgg_child_metadata = self._build_rgg_children_from_indices(
+                source_indices,
+                birth_iter=iter,
+                birth_type="split",
+            )
             self.densification_postfix(
                 new_xyz,
                 new_features_dc,
@@ -1363,7 +1716,7 @@ class GaussianModel:
 
         prune_filter = torch.cat(
             (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device=device, dtype=bool)))
-        self.prune_points(prune_filter, iter)
+        self.prune_points(prune_filter, iter, rgg_death_reason="split_replaced")
         return split_stats
 
 
@@ -1386,6 +1739,7 @@ class GaussianModel:
             rgg_child_metadata = self._build_rgg_children_from_indices(
                 source_indices,
                 birth_iter=iter if iter is not None else 0,
+                birth_type="clone",
             )
             self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
                                        new_rotation, rgg_child_metadata=rgg_child_metadata)
@@ -1430,7 +1784,18 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1,
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, grad_override=None):
+        grad = viewspace_point_tensor.grad if grad_override is None else grad_override
+        if grad is None:
+            raise ValueError("viewspace_point_tensor gradient is required for densification stats")
+        if grad.shape != viewspace_point_tensor.shape:
+            raise ValueError(
+                "densification stats gradient shape must match viewspace_point_tensor shape"
+            )
+        if grad.device != viewspace_point_tensor.device:
+            raise ValueError(
+                "densification stats gradient device must match viewspace_point_tensor device"
+            )
+        self.xyz_gradient_accum[update_filter] += torch.norm(grad[update_filter, :2], dim=-1,
                                                              keepdim=True)
         self.denom[update_filter] += 1

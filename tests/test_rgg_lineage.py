@@ -1,4 +1,6 @@
 import importlib.util
+import csv
+import json
 import random
 import sys
 import types
@@ -100,6 +102,7 @@ def _assert_aligned(model):
     assert model.rgg_source_uid.shape[0] == count
     assert model.rgg_target_uid.shape[0] == count
     assert model.rgg_generation.shape[0] == count
+    assert model.rgg_birth_type.shape[0] == count
 
 
 def _patch_cpu_split_sampling(monkeypatch, module):
@@ -124,6 +127,7 @@ def test_root_uid_unique_and_root_lineage(monkeypatch):
     assert model.rgg_source_uid.tolist() == [-1] * 5
     assert model.rgg_target_uid.tolist() == [-1] * 5
     assert model.rgg_generation.tolist() == [0] * 5
+    assert model.rgg_birth_type.tolist() == [module.RGG_BIRTH_TYPE_ROOT] * 5
     assert model.rgg_next_uid == 5
 
 
@@ -140,6 +144,8 @@ def test_clone_lineage_generation_and_monotonic_uid(monkeypatch):
     assert model.rgg_target_uid[-2:].tolist() == [-1, -1]
     assert model.rgg_birth_iter[-2:].tolist() == [17, 17]
     assert model.rgg_generation[-2:].tolist() == [1, 1]
+    assert model.rgg_birth_type[-2:].tolist() == [module.RGG_BIRTH_TYPE_CLONE, module.RGG_BIRTH_TYPE_CLONE]
+    assert model.get_rgg_h1_records() == []
     assert model.rgg_next_uid == 5
 
 
@@ -159,6 +165,8 @@ def test_split_lineage_and_each_child_gets_distinct_uid(monkeypatch):
     assert model.rgg_target_uid[-2:].tolist() == [-1, -1]
     assert model.rgg_birth_iter[-2:].tolist() == [23, 23]
     assert model.rgg_generation[-2:].tolist() == [1, 1]
+    assert model.rgg_birth_type[-2:].tolist() == [module.RGG_BIRTH_TYPE_SPLIT, module.RGG_BIRTH_TYPE_SPLIT]
+    assert model.get_rgg_h1_records() == []
     assert model.rgg_next_uid == 5
 
 
@@ -181,7 +189,286 @@ def test_proximity_records_source_and_target_uid_with_generation(monkeypatch):
     assert model.rgg_target_uid[-1].item() == 2
     assert model.rgg_birth_iter[-1].item() == 31
     assert model.rgg_generation[-1].item() == 6
+    assert model.rgg_birth_type[-1].item() == module.RGG_BIRTH_TYPE_PROXIMITY
     assert model.rgg_next_uid == 4
+
+
+def _birth_one_proximity_child(module, model, iteration=31):
+    model._scaling.data.fill_(torch.log(torch.tensor(2.0)).item())
+    dist = torch.tensor([0.0, 6.0, 0.0])
+    nearest = torch.tensor([[0], [2], [0]], dtype=torch.long)
+    module.distCUDA2 = lambda xyz: (dist, nearest)
+    model.proximity(scene_extent=1.0, iteration=iteration, N=1)
+    return int(model.rgg_uid[-1].item())
+
+
+def test_h1_cohort_is_proximity_only_and_newborn_evidence_starts_zero(monkeypatch):
+    module = _load_gaussian_model_module(monkeypatch)
+    clone_model = _make_model(module, point_count=3, enabled=True)
+    clone_model.densify_and_clone(torch.ones((3, 3)), grad_threshold=0.5, scene_extent=1.0, iter=10)
+    assert clone_model.get_rgg_h1_records() == []
+
+    model = _make_model(module, point_count=3, enabled=True)
+    model.ensure_visibility_history(2)
+    model.update_visibility(0, torch.tensor([True, False, True]), iteration=1, is_real_view=True)
+    proximity_uid = _birth_one_proximity_child(module, model, iteration=31)
+
+    records = model.get_rgg_h1_records()
+    assert [record["uid"] for record in records] == [proximity_uid]
+    record = records[0]
+    assert record["birth_type"] == "proximity"
+    assert record["birth_iter"] == 31
+    assert record["postbirth_real_opportunities"] == 0
+    assert record["postbirth_real_visible_events"] == 0
+    assert record["postbirth_unique_real_views"] == 0
+    assert record["visible_rate"] == 0.0
+
+
+def test_h1_real_view_evidence_counts_real_not_pseudo_and_unique_views(monkeypatch):
+    module = _load_gaussian_model_module(monkeypatch)
+    model = _make_model(module, point_count=3, enabled=True)
+    model.ensure_visibility_history(3)
+    proximity_uid = _birth_one_proximity_child(module, model, iteration=31)
+
+    model.update_visibility(1, torch.tensor([False, False, False, True]), iteration=32, is_real_view=False)
+    model.update_visibility(1, torch.tensor([False, False, False, True]), iteration=33, is_real_view=True)
+    model.update_visibility(1, torch.tensor([False, False, False, True]), iteration=34, is_real_view=True)
+    model.update_visibility(2, torch.tensor([False, False, False, False]), iteration=35, is_real_view=True)
+
+    record = model.get_rgg_h1_records()[0]
+    assert record["uid"] == proximity_uid
+    assert record["postbirth_real_opportunities"] == 3
+    assert record["postbirth_real_visible_events"] == 2
+    assert record["postbirth_unique_real_views"] == 1
+    assert record["postbirth_real_view_ids"] == [1]
+    assert record["visible_rate"] == pytest.approx(2 / 3)
+
+
+def test_h1_prune_tombstone_survives_after_gaussian_removed(monkeypatch):
+    module = _load_gaussian_model_module(monkeypatch)
+    model = _make_model(module, point_count=3, enabled=True)
+    model.ensure_visibility_history(2)
+    proximity_uid = _birth_one_proximity_child(module, model, iteration=31)
+    model.update_visibility(0, torch.tensor([False, False, False, True]), iteration=32, is_real_view=True)
+
+    model.prune_points(torch.tensor([False, False, False, True]), iter=40)
+
+    records = model.get_rgg_h1_records()
+    assert len(records) == 1
+    assert records[0]["uid"] == proximity_uid
+    assert records[0]["alive"] is False
+    assert records[0]["death_iter"] == 40
+    assert records[0]["death_reason"] == "training_prune"
+    assert proximity_uid not in model.rgg_uid.tolist()
+
+
+def test_h1_split_replacement_tombstone_survives_with_reason(monkeypatch):
+    module = _load_gaussian_model_module(monkeypatch)
+    model = _make_model(module, point_count=3, enabled=True)
+    model.ensure_visibility_history(2)
+    proximity_uid = _birth_one_proximity_child(module, model, iteration=31)
+    grads = torch.tensor([[0.0], [0.0], [0.0], [1.0]])
+    module.distCUDA2 = lambda xyz: (torch.zeros(xyz.shape[0]), torch.zeros((xyz.shape[0], 1), dtype=torch.long))
+    _patch_cpu_split_sampling(monkeypatch, module)
+
+    split_stats = model.densify_and_split(grads, grad_threshold=0.5, scene_extent=0.1, iter=40, N=2)
+
+    records = model.get_rgg_h1_records()
+    assert split_stats == (1, 0, 1)
+    assert records[0]["uid"] == proximity_uid
+    assert records[0]["alive"] is False
+    assert records[0]["death_iter"] == 40
+    assert records[0]["death_reason"] == "split_replaced"
+    assert proximity_uid not in model.rgg_uid.tolist()
+
+
+def test_h1_age_snapshot_uses_first_later_real_opportunity(monkeypatch):
+    module = _load_gaussian_model_module(monkeypatch)
+    model = _make_model(module, point_count=3, enabled=True)
+    model.ensure_visibility_history(2)
+    _birth_one_proximity_child(module, model, iteration=31)
+
+    model.update_visibility(0, torch.tensor([False, False, False, True]), iteration=80, is_real_view=True)
+    assert model.get_rgg_h1_records()[0]["age_snapshots"] == {}
+    model.update_visibility(0, torch.tensor([False, False, False, True]), iteration=81, is_real_view=True)
+
+    snapshot = model.get_rgg_h1_records()[0]["age_snapshots"]["50"]
+    assert snapshot["iteration"] == 81
+    assert snapshot["age"] == 50
+    assert snapshot["postbirth_real_opportunities"] == 2
+    assert snapshot["postbirth_real_visible_events"] == 2
+    assert snapshot["postbirth_unique_real_views"] == 1
+    assert snapshot["visible_rate"] == 1.0
+    assert "alive" not in snapshot
+    assert "death_iter" not in snapshot
+    assert "death_reason" not in snapshot
+
+
+def test_h1_vectorized_evidence_matches_original_statistics_definition(monkeypatch):
+    module = _load_gaussian_model_module(monkeypatch)
+    model = _make_model(module, point_count=3, enabled=True)
+    model.ensure_visibility_history(4)
+    first_uid = _birth_one_proximity_child(module, model, iteration=31)
+    model._scaling.data.fill_(torch.log(torch.tensor(2.0)).item())
+    dist = torch.tensor([0.0, 6.0, 0.0, 0.0])
+    nearest = torch.tensor([[0], [2], [0], [0]], dtype=torch.long)
+    module.distCUDA2 = lambda xyz: (dist, nearest)
+    model.proximity(scene_extent=1.0, iteration=32, N=1)
+    second_uid = int(model.rgg_uid[-1].item())
+
+    model.update_visibility(0, torch.tensor([False, False, False, True, False]), iteration=33, is_real_view=True)
+    model.update_visibility(1, torch.tensor([False, False, False, False, True]), iteration=34, is_real_view=True)
+    model.update_visibility(0, torch.tensor([False, False, False, True, True]), iteration=35, is_real_view=True)
+
+    records = {record["uid"]: record for record in model.get_rgg_h1_records()}
+    assert records[first_uid]["postbirth_real_opportunities"] == 3
+    assert records[first_uid]["postbirth_real_visible_events"] == 2
+    assert records[first_uid]["postbirth_unique_real_views"] == 1
+    assert records[first_uid]["postbirth_real_view_ids"] == [0]
+    assert records[second_uid]["postbirth_real_opportunities"] == 3
+    assert records[second_uid]["postbirth_real_visible_events"] == 2
+    assert records[second_uid]["postbirth_unique_real_views"] == 2
+    assert records[second_uid]["postbirth_real_view_ids"] == [0, 1]
+
+
+def test_h1_birth_registration_batch_transfer_preserves_metadata(monkeypatch):
+    module = _load_gaussian_model_module(monkeypatch)
+    model = _make_model(module, point_count=3, enabled=True)
+    model._opacity.data = module.inverse_sigmoid(torch.tensor([[0.10], [0.20], [0.30]], dtype=torch.float32))
+    metadata = {
+        "uid": torch.tensor([10, 11, 12], dtype=torch.long),
+        "birth_iter": torch.tensor([50, 51, 52], dtype=torch.long),
+        "source_uid": torch.tensor([1, 2, 3], dtype=torch.long),
+        "target_uid": torch.tensor([4, 5, 6], dtype=torch.long),
+        "generation": torch.tensor([2, 3, 4], dtype=torch.long),
+        "birth_type": torch.tensor(
+            [
+                module.RGG_BIRTH_TYPE_CLONE,
+                module.RGG_BIRTH_TYPE_PROXIMITY,
+                module.RGG_BIRTH_TYPE_PROXIMITY,
+            ],
+            dtype=torch.long,
+        ),
+    }
+
+    model._register_rgg_h1_births(metadata)
+
+    records = model.get_rgg_h1_records()
+    assert [record["uid"] for record in records] == [11, 12]
+    assert [record["birth_iter"] for record in records] == [51, 52]
+    assert [record["source_uid"] for record in records] == [2, 3]
+    assert [record["target_uid"] for record in records] == [5, 6]
+    assert [record["generation"] for record in records] == [3, 4]
+    assert [record["birth_type"] for record in records] == ["proximity", "proximity"]
+    assert [record["birth_opacity"] for record in records] == pytest.approx([0.20, 0.30])
+
+
+def test_h1_opacity_birth_snapshot_future_round_trip(monkeypatch, tmp_path):
+    module = _load_gaussian_model_module(monkeypatch)
+    model = _make_model(module, point_count=3, enabled=True)
+    model.ensure_visibility_history(2)
+    model._opacity.data[2] = module.inverse_sigmoid(torch.tensor(0.25))
+    proximity_uid = _birth_one_proximity_child(module, model, iteration=100)
+    model._opacity.data[-1] = module.inverse_sigmoid(torch.tensor(0.30))
+    model.update_visibility(0, torch.tensor([False, False, False, True]), iteration=150, is_real_view=True)
+    model._opacity.data[-1] = module.inverse_sigmoid(torch.tensor(0.40))
+    model.update_visibility(0, torch.tensor([False, False, False, True]), iteration=200, is_real_view=True)
+    model._opacity.data[-1] = module.inverse_sigmoid(torch.tensor(0.50))
+    model.update_visibility(0, torch.tensor([False, False, False, True]), iteration=300, is_real_view=True)
+    model._opacity.data[-1] = module.inverse_sigmoid(torch.tensor(0.60))
+    model.update_visibility(0, torch.tensor([False, False, False, True]), iteration=450, is_real_view=True)
+    model._opacity.data[-1] = module.inverse_sigmoid(torch.tensor(0.70))
+    model.update_visibility(0, torch.tensor([False, False, False, True]), iteration=650, is_real_view=True)
+
+    record = model.get_rgg_h1_records(observation_end_iter=650)[0]
+
+    assert record["uid"] == proximity_uid
+    assert record["birth_opacity"] == pytest.approx(0.25)
+    assert record["age_snapshots"]["50"]["opacity"] == pytest.approx(0.30)
+    assert record["age_snapshots"]["100"]["opacity"] == pytest.approx(0.40)
+    assert record["age_snapshots"]["200"]["opacity"] == pytest.approx(0.50)
+    assert record["age_snapshots"]["350"]["opacity"] == pytest.approx(0.60)
+    assert record["age_snapshots"]["550"]["opacity"] == pytest.approx(0.70)
+
+    model.save_rgg_diagnostics(tmp_path, observation_end_iter=650)
+    data = json.loads((tmp_path / "h1_proximity_postbirth_support.json").read_text(encoding="utf-8"))
+    assert data[0]["birth_opacity"] == pytest.approx(0.25)
+    assert data[0]["age_snapshots"]["350"]["opacity"] == pytest.approx(0.60)
+    with (tmp_path / "h1_proximity_postbirth_support.csv").open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert float(rows[0]["birth_opacity"]) == pytest.approx(0.25)
+    assert float(rows[0]["age_350_opacity"]) == pytest.approx(0.60)
+    assert float(rows[0]["age_550_opacity"]) == pytest.approx(0.70)
+
+
+def test_h1_registry_checkpoint_round_trip(monkeypatch, tmp_path):
+    module = _load_gaussian_model_module(monkeypatch)
+    source = _make_model(module, point_count=3, enabled=True)
+    source.ensure_visibility_history(2)
+    _birth_one_proximity_child(module, source, iteration=31)
+    source.update_visibility(0, torch.tensor([False, False, False, True]), iteration=32, is_real_view=True)
+    source.prune_points(torch.tensor([False, False, False, True]), iter=40)
+    path = tmp_path / "paired_chkpnt32.pth"
+
+    save_paired_fork_checkpoint(path, source, 32)
+    restored = _make_model(module, point_count=1, enabled=True)
+    load_paired_fork_checkpoint(path, restored, _training_args())
+
+    assert restored.get_rgg_h1_records() == source.get_rgg_h1_records()
+    assert restored.get_rgg_h1_records()[0]["death_reason"] == "training_prune"
+
+
+def test_h1_json_and_csv_exports_include_observation_horizon_and_summary(monkeypatch, tmp_path):
+    module = _load_gaussian_model_module(monkeypatch)
+    model = _make_model(module, point_count=3, enabled=True)
+    model.ensure_visibility_history(2)
+    _birth_one_proximity_child(module, model, iteration=31)
+    model.prune_points(torch.tensor([False, False, False, True]), iter=40)
+
+    model.save_rgg_diagnostics(tmp_path, observation_end_iter=90)
+
+    json_path = tmp_path / "h1_proximity_postbirth_support.json"
+    csv_path = tmp_path / "h1_proximity_postbirth_support.csv"
+    summary_path = tmp_path / "h1_summary.json"
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    assert data[0]["death_reason"] == "training_prune"
+    assert data[0]["observation_end_iter"] == 90
+    assert data[0]["age_at_export"] == 59
+    assert data[0]["terminal_age"] == 9
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert "death_reason" in rows[0]
+    assert rows[0]["death_reason"] == "training_prune"
+    assert rows[0]["observation_end_iter"] == "90"
+    assert rows[0]["age_at_export"] == "59"
+    assert rows[0]["terminal_age"] == "9"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["observation_end_iter"] == 90
+    assert summary["total_proximity_records"] == 1
+    assert summary["alive"] == 0
+    assert summary["training_prune"] == 1
+
+
+def test_h1_observation_horizon_alive_and_terminal_age(monkeypatch, tmp_path):
+    module = _load_gaussian_model_module(monkeypatch)
+    alive_model = _make_model(module, point_count=3, enabled=True)
+    alive_model.ensure_visibility_history(2)
+    _birth_one_proximity_child(module, alive_model, iteration=600)
+
+    alive_model.save_rgg_diagnostics(tmp_path / "alive", observation_end_iter=900)
+    alive_data = json.loads((tmp_path / "alive" / "h1_proximity_postbirth_support.json").read_text(encoding="utf-8"))
+    assert alive_data[0]["age_at_export"] == 300
+    assert alive_data[0]["terminal_age"] is None
+
+    dead_model = _make_model(module, point_count=3, enabled=True)
+    dead_model.ensure_visibility_history(2)
+    _birth_one_proximity_child(module, dead_model, iteration=600)
+    dead_model.prune_points(torch.tensor([False, False, False, True]), iter=750)
+
+    dead_model.save_rgg_diagnostics(tmp_path / "dead", observation_end_iter=900)
+    dead_data = json.loads((tmp_path / "dead" / "h1_proximity_postbirth_support.json").read_text(encoding="utf-8"))
+    assert dead_data[0]["age_at_export"] == 300
+    assert dead_data[0]["terminal_age"] == 150
 
 
 def test_proximity_rgg_source_target_count_mismatch_raises(monkeypatch):

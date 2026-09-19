@@ -30,6 +30,31 @@ from utils.observation_evidence import (
     format_observation_evidence_edge_diag,
     format_observation_reliability_diag,
 )
+from utils.evidence_support import (
+    compute_edge_stratified_reliability_diagnostics,
+    compute_real_depth_evidence_diagnostics,
+    compute_rgb_error_map,
+    compute_spatial_reliability_diagnostics,
+    format_real_depth_evidence_diag,
+    make_edge_stratified_reliability_record,
+    make_spatial_reliability_record,
+    preserved_random_state,
+    save_edge_stratified_reliability_summary,
+    save_real_depth_evidence_summary,
+    save_spatial_reliability_summary,
+    should_run_edge_stratified_reliability_snapshot,
+    should_run_real_depth_evidence_diagnostics,
+    should_run_spatial_reliability_snapshot,
+)
+from utils.evidence_structural_loss import (
+    compute_oe_structural_loss,
+    compute_stable_mask_from_gt_rgb,
+    format_oe_structural_loss_log,
+    make_oe_structural_record,
+    save_oe_structural_training_summary,
+    should_apply_oe_structural_loss,
+)
+from utils.oe_densification import should_preserve_baseline_densification_stats
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -47,6 +72,8 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from lpipsPyTorch import lpips
+
+SPATIAL_RELIABILITY_SNAPSHOTS = (500, 1000, 1500, 2000)
 
 
 def collect_observation_evidence_snapshot(gaussians, train_cameras, pipe, background, render_func=render):
@@ -79,6 +106,129 @@ def collect_observation_evidence_snapshot(gaussians, train_cameras, pipe, backgr
         torch.set_rng_state(torch_rng_state)
         if cuda_rng_state is not None:
             torch.cuda.set_rng_state_all(cuda_rng_state)
+
+
+def collect_spatial_reliability_snapshot(
+    iteration,
+    gaussians,
+    train_cameras,
+    pipe,
+    background,
+    model_path,
+    camera_uid_to_train_index=None,
+    save_visualizations=False,
+    render_func=render,
+):
+    records = []
+    edge_records = []
+    output_dir = os.path.join(model_path, "oe_diagnostics", "spatial_reliability_png")
+    with preserved_random_state():
+        with torch.no_grad():
+            for fallback_index, camera in enumerate(train_cameras):
+                if getattr(camera, "depth_image", None) is None:
+                    continue
+                render_pkg = render_func(camera, gaussians, pipe, background)
+                depth_diag = compute_real_depth_evidence_diagnostics(
+                    render_pkg["depth"][0].detach(),
+                    torch.as_tensor(camera.depth_image, device=render_pkg["depth"].device).detach(),
+                    return_evidence=True,
+                )
+                reliability = compute_spatial_reliability_diagnostics(
+                    depth_diag,
+                    render_pkg["render"].detach(),
+                    camera.original_image.detach().to(device=render_pkg["render"].device),
+                )
+                edge_reliability = compute_edge_stratified_reliability_diagnostics(
+                    depth_diag,
+                    render_pkg["render"].detach(),
+                    camera.original_image.detach().to(device=render_pkg["render"].device),
+                )
+                view_id = (
+                    camera_uid_to_train_index.get(getattr(camera, "uid", None), fallback_index)
+                    if camera_uid_to_train_index is not None
+                    else fallback_index
+                )
+                records.append(make_spatial_reliability_record(iteration, view_id, depth_diag["stats"], reliability))
+                edge_records.append(make_edge_stratified_reliability_record(iteration, view_id, edge_reliability))
+                if save_visualizations:
+                    save_spatial_reliability_visualizations(
+                        output_dir,
+                        iteration,
+                        view_id,
+                        render_pkg["render"].detach(),
+                        camera.original_image.detach().to(device=render_pkg["render"].device),
+                        depth_diag,
+                        edge_reliability=edge_reliability,
+                    )
+    return records, edge_records
+
+
+def save_spatial_reliability_visualizations(
+    output_dir,
+    iteration,
+    view_id,
+    rendered_rgb,
+    gt_rgb,
+    depth_diag,
+    edge_reliability=None,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    rgb_error, _ = compute_rgb_error_map(rendered_rgb, gt_rgb)
+    items = {
+        "rendered_rgb": _rgb_to_numpy(rendered_rgb),
+        "gt_rgb": _rgb_to_numpy(gt_rgb),
+        "rgb_error": _map_to_numpy(rgb_error),
+        "normalized_depth_residual": _map_to_numpy(depth_diag["normalized_absolute_residual"]),
+        "evidence": _evidence_to_numpy(depth_diag["evidence"]),
+    }
+    if edge_reliability is not None:
+        items.update(
+            {
+                "edge_magnitude": _map_to_numpy(edge_reliability["edge_magnitude"]),
+                "edge_mask": _binary_to_numpy(edge_reliability["edge_mask"]),
+                "non_edge_mask": _binary_to_numpy(edge_reliability["non_edge_mask"]),
+            }
+        )
+    for name, array in items.items():
+        plt.imsave(os.path.join(output_dir, f"iter_{iteration}_view_{view_id}_{name}.png"), array)
+
+
+def _rgb_to_numpy(image):
+    image = image.detach().float().cpu()
+    if image.ndim == 3 and image.shape[0] in (1, 3):
+        image = image.permute(1, 2, 0)
+    return image.clamp(0.0, 1.0).numpy()
+
+
+def _map_to_numpy(values):
+    values = values.detach().float().cpu()
+    if values.ndim == 3 and values.shape[0] == 1:
+        values = values[0]
+    finite = torch.isfinite(values)
+    if not finite.any():
+        return torch.zeros_like(values).numpy()
+    result = torch.zeros_like(values)
+    finite_values = values[finite]
+    low = finite_values.min()
+    high = finite_values.max()
+    if float((high - low).item()) > 1e-8:
+        result[finite] = (finite_values - low) / (high - low)
+    else:
+        result[finite] = 1.0
+    return result.numpy()
+
+
+def _evidence_to_numpy(values):
+    values = values.detach().float().cpu()
+    if values.ndim == 3 and values.shape[0] == 1:
+        values = values[0]
+    values = torch.nan_to_num(values, nan=0.0, posinf=1.0, neginf=0.0)
+    return values.clamp(0.0, 1.0).numpy()
+
+
+def _binary_to_numpy(values):
+    values = values.detach().bool().cpu()
+    return values.float().numpy()
 
 
 def training(dataset, opt, pipe, args):
@@ -121,6 +271,11 @@ def training(dataset, opt, pipe, args):
 
     viewpoint_stack, pseudo_stack = None, None
     ema_loss_for_log = 0.0
+    real_depth_evidence_records = []
+    spatial_reliability_records = []
+    edge_stratified_reliability_records = []
+    oe_structural_records = []
+    oe_stable_mask_cache = {}
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
         if paired_fork_resumed_from is not None and iteration == next_iteration_after_paired_fork(paired_fork_resumed_from):
@@ -164,13 +319,13 @@ def training(dataset, opt, pipe, args):
             train_view_index = gaussians.camera_uid_to_train_index[viewpoint_cam.uid]
         else:
             train_view_index = train_cameras.index(viewpoint_cam)
-        gaussians.update_visibility(train_view_index, visibility_filter)
+        gaussians.update_visibility(train_view_index, visibility_filter, iteration=iteration, is_real_view=True)
 
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 =  l1_loss_mask(image, gt_image)
-        loss = ((1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)))
+        base_loss = ((1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)))
 
 
         rendered_depth = render_pkg["depth"][0]
@@ -182,7 +337,7 @@ def training(dataset, opt, pipe, args):
                         (1 - pearson_corrcoef( - midas_depth, rendered_depth)),
                         (1 - pearson_corrcoef(1 / (midas_depth + 200.), rendered_depth))
         )
-        loss += args.depth_weight * depth_loss
+        base_loss += args.depth_weight * depth_loss
 
         if iteration > args.end_sample_pseudo:
             args.depth_weight = 0.001
@@ -204,38 +359,132 @@ def training(dataset, opt, pipe, args):
 
             if torch.isnan(depth_loss_pseudo).sum() == 0:
                 loss_scale = min((iteration - args.start_sample_pseudo) / 500., 1)
-                loss += loss_scale * args.depth_pseudo_weight * depth_loss_pseudo
+                base_loss += loss_scale * args.depth_pseudo_weight * depth_loss_pseudo
 
+        oe_loss_active = (
+            should_apply_oe_structural_loss(
+                getattr(args, "enable_oe_structural_loss", False),
+                iteration,
+                getattr(args, "oe_structural_start_iter", 500),
+                getattr(args, "oe_structural_end_iter", 2000),
+                getattr(args, "oe_structural_weight", 0.0),
+            )
+            and getattr(viewpoint_cam, "depth_image", None) is not None
+        )
+        oe_weighted_loss = None
+        if oe_loss_active:
+            if train_view_index not in oe_stable_mask_cache:
+                stable_mask, _, _ = compute_stable_mask_from_gt_rgb(
+                    gt_image.detach(),
+                    stable_quantile=getattr(args, "oe_stable_quantile", 0.80),
+                )
+                oe_stable_mask_cache[train_view_index] = stable_mask.detach()
+            oe_struct_loss, oe_struct_stats, _ = compute_oe_structural_loss(
+                render_pkg["depth"][0],
+                torch.as_tensor(viewpoint_cam.depth_image, device=render_pkg["depth"].device).detach(),
+                stable_mask=oe_stable_mask_cache[train_view_index].to(device=render_pkg["depth"].device),
+                gate_mode=getattr(args, "oe_structure_gate_mode", "stable_evidence"),
+                stable_quantile=getattr(args, "oe_stable_quantile", 0.80),
+            )
+            oe_weighted_loss = float(getattr(args, "oe_structural_weight", 0.0)) * oe_struct_loss
+            if iteration % 100 == 0:
+                weight = float(getattr(args, "oe_structural_weight", 0.0))
+                print(format_oe_structural_loss_log(iteration, train_view_index, oe_struct_stats, weight), flush=True)
+                oe_structural_records.append(
+                    make_oe_structural_record(iteration, train_view_index, oe_struct_stats, weight)
+                )
+
+        loss = base_loss if oe_weighted_loss is None else base_loss + oe_weighted_loss
+        preserve_oe_densification_stats = should_preserve_baseline_densification_stats(
+            getattr(args, "oe_preserve_baseline_densification_stats", False),
+            oe_loss_active,
+            iteration,
+            opt.densify_until_iter,
+        )
+        baseline_viewspace_grad = None
+        if preserve_oe_densification_stats:
+            baseline_viewspace_grad = torch.autograd.grad(
+                base_loss,
+                viewspace_point_tensor,
+                retain_graph=True,
+                allow_unused=False,
+            )[0].detach()
+            viewspace_point_tensor.grad = None
 
         loss.backward()
         with torch.no_grad():
+            if preserve_oe_densification_stats and iteration % 100 == 0:
+                visible_base_grad = torch.norm(baseline_viewspace_grad[visibility_filter, :2], dim=-1)
+                visible_total_grad = torch.norm(viewspace_point_tensor.grad[visibility_filter, :2], dim=-1)
+                visible_count = int(visible_base_grad.numel())
+                if visible_count > 0:
+                    base_grad_mean = float(visible_base_grad.mean().item())
+                    total_grad_mean = float(visible_total_grad.mean().item())
+                    base_grad_p90 = float(torch.quantile(visible_base_grad, 0.90).item())
+                    total_grad_p90 = float(torch.quantile(visible_total_grad, 0.90).item())
+                    ratio_mean = total_grad_mean / max(base_grad_mean, 1e-12)
+                else:
+                    base_grad_mean = 0.0
+                    total_grad_mean = 0.0
+                    base_grad_p90 = 0.0
+                    total_grad_p90 = 0.0
+                    ratio_mean = 0.0
+                print(
+                    "[OEDensifyGrad] "
+                    f"iter={iteration} "
+                    f"base_grad_mean={base_grad_mean:.8g} "
+                    f"total_grad_mean={total_grad_mean:.8g} "
+                    f"base_grad_p90={base_grad_p90:.8g} "
+                    f"total_grad_p90={total_grad_p90:.8g} "
+                    f"ratio_mean={ratio_mean:.8g} "
+                    f"visible_count={visible_count}",
+                    flush=True,
+                )
             if (
-                getattr(args, "enable_observation_evidence_diagnostics", False)
-                and opt.densify_from_iter < iteration < opt.densify_until_iter
-                and iteration % opt.densification_interval == 0
-                and all(getattr(camera, "depth_image", None) is not None for camera in train_cameras)
+                should_run_real_depth_evidence_diagnostics(
+                    getattr(args, "enable_observation_evidence_diagnostics", False),
+                    iteration,
+                    max(int(getattr(opt, "densification_interval", 100)), 100),
+                )
+                and getattr(viewpoint_cam, "depth_image", None) is not None
             ):
-                rendered_depths, mono_depths, visibility_masks, valid_masks, rendered_rgbs = collect_observation_evidence_snapshot(
+                depth_diag = compute_real_depth_evidence_diagnostics(
+                    render_pkg["depth"][0].detach(),
+                    torch.as_tensor(viewpoint_cam.depth_image, device=render_pkg["depth"].device).detach(),
+                    return_evidence=True,
+                )
+                depth_stats = depth_diag["stats"]
+                record = {
+                    "iteration": int(iteration),
+                    "view_id": int(train_view_index),
+                    **depth_stats,
+                }
+                real_depth_evidence_records.append(record)
+                print(format_real_depth_evidence_diag(iteration, train_view_index, depth_stats), flush=True)
+            if (
+                should_run_spatial_reliability_snapshot(
+                    getattr(args, "enable_observation_evidence_diagnostics", False),
+                    iteration,
+                    SPATIAL_RELIABILITY_SNAPSHOTS,
+                )
+                or should_run_edge_stratified_reliability_snapshot(
+                    getattr(args, "enable_observation_evidence_diagnostics", False),
+                    iteration,
+                    SPATIAL_RELIABILITY_SNAPSHOTS,
+                )
+            ):
+                spatial_records, edge_records = collect_spatial_reliability_snapshot(
+                    iteration,
                     gaussians,
                     train_cameras,
                     pipe,
                     background,
+                    scene.model_path,
+                    camera_uid_to_train_index=gaussians.camera_uid_to_train_index,
+                    save_visualizations=iteration == max(SPATIAL_RELIABILITY_SNAPSHOTS),
                 )
-                obs_stats, _, _, _ = compute_observation_evidence_diagnostics(
-                    gaussians.get_xyz.detach(),
-                    gaussians.get_scaling.detach(),
-                    gaussians._rotation.detach(),
-                    train_cameras,
-                    rendered_depths,
-                    mono_depths,
-                    visibility_masks,
-                    valid_masks=valid_masks,
-                    rendered_rgbs=rendered_rgbs,
-                    knn_k=getattr(args, "knn_k", 12),
-                )
-                print(format_observation_evidence_diag(iteration, obs_stats), flush=True)
-                print(format_observation_evidence_edge_diag(iteration, obs_stats), flush=True)
-                print(format_observation_reliability_diag(iteration, obs_stats), flush=True)
+                spatial_reliability_records.extend(spatial_records)
+                edge_stratified_reliability_records.extend(edge_records)
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
@@ -261,7 +510,11 @@ def training(dataset, opt, pipe, args):
             if  iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                gaussians.add_densification_stats(
+                    viewspace_point_tensor,
+                    visibility_filter,
+                    grad_override=baseline_viewspace_grad if preserve_oe_densification_stats else None,
+                )
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = None
@@ -293,6 +546,22 @@ def training(dataset, opt, pipe, args):
                     gaussians,
                     iteration,
                 )
+
+    if getattr(args, "enable_observation_evidence_diagnostics", False):
+        save_real_depth_evidence_summary(scene.model_path, real_depth_evidence_records)
+        save_spatial_reliability_summary(scene.model_path, spatial_reliability_records)
+        save_edge_stratified_reliability_summary(scene.model_path, edge_stratified_reliability_records)
+    if getattr(args, "enable_oe_structural_loss", False):
+        save_oe_structural_training_summary(scene.model_path, oe_structural_records)
+    save_final_rgg_diagnostics(args, opt, scene, gaussians)
+
+
+def save_final_rgg_diagnostics(args, opt, scene, gaussians):
+    if getattr(args, "enable_rgg_diagnostics", False):
+        gaussians.save_rgg_diagnostics(
+            os.path.join(scene.model_path, "rgg_diagnostics_final"),
+            observation_end_iter=opt.iterations,
+        )
 
 
 def prepare_output_and_logger(args):

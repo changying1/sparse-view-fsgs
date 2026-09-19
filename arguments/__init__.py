@@ -121,6 +121,13 @@ class OptimizationParams(ParamGroup):
         self.enable_child_structure_diagnostics = False
         self.enable_structural_child_target_selection = False
         self.enable_observation_evidence_diagnostics = False
+        self.enable_oe_structural_loss = False
+        self.oe_structural_weight = 0.0
+        self.oe_structure_gate_mode = "stable_evidence"
+        self.oe_stable_quantile = 0.80
+        self.oe_structural_start_iter = 500
+        self.oe_structural_end_iter = 2000
+        self.oe_preserve_baseline_densification_stats = False
         self.enable_rgg_diagnostics = False
         self.normalization_low_quantile = 0.05
         self.normalization_high_quantile = 0.95
@@ -195,6 +202,17 @@ def validate_optimization_params(args):
         raise ValueError("gestalt_value_lambda must be non-negative")
     if not (0 <= float(getattr(args, "gestalt_balance_alpha", 0.5)) <= 1):
         raise ValueError("gestalt_balance_alpha must satisfy 0 <= alpha <= 1")
+    if float(getattr(args, "oe_structural_weight", 0.0)) < 0:
+        raise ValueError("oe_structural_weight must be non-negative")
+    gate_mode = getattr(args, "oe_structure_gate_mode", "stable_evidence")
+    if gate_mode not in ("none", "stable_only", "evidence_only", "stable_evidence", "matched_stable"):
+        raise ValueError(
+            "oe_structure_gate_mode must be one of none, stable_only, evidence_only, stable_evidence, matched_stable"
+        )
+    if not (0 <= float(getattr(args, "oe_stable_quantile", 0.80)) <= 1):
+        raise ValueError("oe_stable_quantile must satisfy 0 <= q <= 1")
+    if int(getattr(args, "oe_structural_start_iter", 500)) > int(getattr(args, "oe_structural_end_iter", 2000)):
+        raise ValueError("oe_structural_start_iter must be <= oe_structural_end_iter")
     low = float(getattr(args, "normalization_low_quantile", 0.05))
     high = float(getattr(args, "normalization_high_quantile", 0.95))
     if not (0 <= low < high <= 1):
